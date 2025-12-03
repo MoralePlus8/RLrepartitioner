@@ -1,0 +1,8 @@
+Package: liblzma
+Version: 5.6.2
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: arm64-osx
+Multi-Arch: same
+Abi: 5aee4376cb5ff49f9855c69b30c7b734e9dea228d77db17feac11d0fb90bfb72
+Description: Compression library with an API similar to that of zlib.
+Status: install ok installed
