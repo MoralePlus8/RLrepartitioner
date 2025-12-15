@@ -7,6 +7,7 @@
 #include "modules.h"
 
 struct random : public champsim::modules::replacement {
+  long NUM_WAY;
   std::mt19937_64 rng{};
   std::uniform_int_distribution<long> dist;
 

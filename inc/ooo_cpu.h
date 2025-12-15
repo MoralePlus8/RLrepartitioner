@@ -183,6 +183,9 @@ public:
   [[nodiscard]] auto sim_instr() const { return num_retired - begin_phase_instr; }
   [[nodiscard]] auto sim_cycle() const { return (current_time.time_since_epoch() / clock_period) - sim_stats.begin_cycles; }
 
+  // Heartbeat output function - can be called externally for synchronized multi-core output
+  void print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle);
+  
   void print_deadlock() final;
 
 #include "module_decl.inc"

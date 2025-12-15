@@ -22,6 +22,7 @@ struct srrip_set_helper {
 
 struct srrip : public champsim::modules::replacement {
 
+  long NUM_WAY;
   std::vector<srrip_set_helper> sets;
 
   explicit srrip(CACHE* cache);

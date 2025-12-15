@@ -138,7 +138,7 @@ CACHE::mshr_type CACHE::mshr_type::merge(mshr_type predecessor, mshr_type succes
   return retval;
 }
 
-auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
+auto CACHE::fill_block(mshr_type mshr, uint32_t metadata, uint64_t current_cycle) -> BLOCK
 {
   CACHE::BLOCK to_fill;
   to_fill.valid = true;
@@ -149,6 +149,7 @@ auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
   to_fill.data = mshr.data_promise->data;
   to_fill.pf_metadata = metadata;
   to_fill.cpu = mshr.cpu;  // Record which CPU owns this cache block
+  to_fill.fill_cycle = current_cycle;  // Record which cycle this cache line was filled
 
   return to_fill;
 }
@@ -171,13 +172,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 {
   cpu = fill_mshr.cpu;
 
-  // find victim
+  // find victim - let the replacement policy decide (including finding invalid ways)
+  // This ensures partitioning strategies can enforce partition boundaries even during initial fill
   auto [set_begin, set_end] = get_set_span(fill_mshr.address);
-  auto way = std::find_if_not(set_begin, set_end, [](auto x) { return x.valid; });
-  if (way == set_end) {
-    way = std::next(set_begin, impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip,
-                                                fill_mshr.address, fill_mshr.type));
-  }
+  auto way = std::next(set_begin, impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip,
+                                                   fill_mshr.address, fill_mshr.type));
   assert(set_begin <= way);
   assert(way <= set_end);
   assert(way != set_end || fill_mshr.type != access_type::WRITE); // Writes may not bypass
@@ -232,22 +231,46 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
       ++sim_stats.pf_fill;
     }
 
-    // Track cache competition: when one core evicts another core's cache line
-    if (way->valid && NUM_CPUS > 1) {
+    // Track cache competition: when one core evicts another core's cache line (LLC only)
+    if (way->valid && NUM_CPUS > 1 && NAME == "LLC") {
       uint32_t evicting_cpu = fill_mshr.cpu;
       uint32_t evicted_cpu = way->cpu;
       if (evicting_cpu != evicted_cpu) {
         // CPU evicting_cpu caused an eviction of CPU evicted_cpu's cache line
         if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
-          ++sim_stats.evictions_caused[evicting_cpu];
+          ++g_llc_stats.evictions_caused[evicting_cpu];
         }
         if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
-          ++sim_stats.evicted_by_others[evicted_cpu];
+          ++g_llc_stats.evicted_by_others[evicted_cpu];
         }
       }
     }
 
-    *way = fill_block(fill_mshr, metadata_thru);
+    // Track cache line lifetime statistics (LLC only)
+    if (way->valid && NAME == "LLC") {
+      uint32_t evicting_cpu = fill_mshr.cpu;
+      uint32_t evicted_cpu = way->cpu;
+      
+      // Track total evictions caused by each CPU (includes both self and other cores' cache lines)
+      if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
+        ++g_llc_stats.total_evictions_caused[evicting_cpu];
+      }
+      
+      if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
+        // Calculate the lifetime of this cache line in cycles (directly subtract cycle numbers)
+        uint64_t current_cycle = current_time.time_since_epoch() / clock_period;
+        uint64_t lifetime_cycles = current_cycle - way->fill_cycle;
+        g_llc_stats.total_lifetime_cycles[evicted_cpu] += lifetime_cycles;
+        ++g_llc_stats.eviction_count[evicted_cpu];
+      }
+    }
+
+    *way = fill_block(fill_mshr, metadata_thru, current_time.time_since_epoch() / clock_period);
+    
+    // Track fill count for Little's Law calculation (LLC only)
+    if (NAME == "LLC" && fill_mshr.cpu < MAX_CPUS_FOR_COMPETITION) {
+      ++g_llc_stats.fill_count[fill_mshr.cpu];
+    }
   }
 
   // COLLECT STATS
@@ -266,6 +289,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 {
   cpu = handle_pkt.cpu;
+
+  // Track LLC access stats per CPU
+  if (NAME == "LLC" && handle_pkt.cpu < MAX_CPUS_FOR_COMPETITION) {
+    ++g_llc_stats.accesses[handle_pkt.cpu];
+  }
 
   // access cache
   auto [set_begin, set_end] = get_set_span(handle_pkt.address);
@@ -384,6 +412,11 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
+  // Track LLC miss stats per CPU
+  if (NAME == "LLC" && handle_pkt.cpu < MAX_CPUS_FOR_COMPETITION) {
+    ++g_llc_stats.misses[handle_pkt.cpu];
+  }
+
   return true;
 }
 
@@ -428,8 +461,12 @@ auto CACHE::initiate_tag_check(champsim::channel* ul)
   };
 }
 
-// Heartbeat period for LLC competition stats (in cycles)
-constexpr long long LLC_HEARTBEAT_PERIOD = 10000000;
+// Global LLC stats instance
+llc_stats g_llc_stats;
+
+// CSV export globals
+std::string g_llc_stats_csv_path = "llc_stats.csv";
+bool g_llc_stats_csv_header_written = false;
 
 long CACHE::operate()
 {
@@ -444,33 +481,6 @@ long CACHE::operate()
 
   for (auto* ul : upper_levels) {
     ul->check_collision();
-  }
-
-  // LLC competition heartbeat: print stats every LLC_HEARTBEAT_PERIOD cycles
-  if (NAME == "LLC" && NUM_CPUS > 1) {
-    using double_duration = std::chrono::duration<double, typename champsim::chrono::picoseconds::period>;
-    auto cycles_since_heartbeat = double_duration{current_time - last_heartbeat_time} / clock_period;
-    
-    if (cycles_since_heartbeat >= LLC_HEARTBEAT_PERIOD) {
-      fmt::print("\n=== LLC Cache Competition Heartbeat (cycle: {}) ===\n", 
-                 current_time.time_since_epoch() / clock_period);
-      
-      for (std::size_t cpu = 0; cpu < NUM_CPUS && cpu < MAX_CPUS_FOR_COMPETITION; ++cpu) {
-        uint64_t period_evictions_caused = sim_stats.evictions_caused[cpu] - last_heartbeat_evictions_caused[cpu];
-        uint64_t period_evicted_by_others = sim_stats.evicted_by_others[cpu] - last_heartbeat_evicted_by_others[cpu];
-        
-        fmt::print("  CPU {}: evicted others' lines: {} (total: {}), own lines evicted by others: {} (total: {})\n",
-                   cpu, period_evictions_caused, sim_stats.evictions_caused[cpu],
-                   period_evicted_by_others, sim_stats.evicted_by_others[cpu]);
-        
-        // Update last heartbeat values
-        last_heartbeat_evictions_caused[cpu] = sim_stats.evictions_caused[cpu];
-        last_heartbeat_evicted_by_others[cpu] = sim_stats.evicted_by_others[cpu];
-      }
-      fmt::print("================================================\n\n");
-      
-      last_heartbeat_time = current_time;
-    }
   }
 
   // Finish returns
@@ -560,6 +570,26 @@ long CACHE::operate()
   inflight_tag_check.erase(tag_check_ready_begin, finish_tag_check_end);
 
   impl_prefetcher_cycle_operate();
+
+  // Sample way occupancy statistics for LLC (sample every 10000 cycles to reduce overhead)
+  if (NAME == "LLC") {
+    constexpr uint64_t WAY_OCCUPANCY_SAMPLE_INTERVAL = 10000;
+    uint64_t current_cycle = current_time.time_since_epoch() / clock_period;
+    if (current_cycle % WAY_OCCUPANCY_SAMPLE_INTERVAL == 0) {
+      // Count how many valid cache lines each CPU owns
+      std::vector<uint64_t> cpu_way_count(MAX_CPUS_FOR_COMPETITION, 0);
+      for (const auto& blk : block) {
+        if (blk.valid && blk.cpu < MAX_CPUS_FOR_COMPETITION) {
+          ++cpu_way_count[blk.cpu];
+        }
+      }
+      // Add to cumulative samples
+      for (std::size_t i = 0; i < MAX_CPUS_FOR_COMPETITION; ++i) {
+        g_llc_stats.way_occupancy_samples[i] += cpu_way_count[i];
+      }
+      ++g_llc_stats.way_occupancy_sample_count;
+    }
+  }
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} cycle completed: {} tags checked: {} remaining: {} stash consumed: {} remaining: {} channel consumed: {} pq consumed {} unused consume "

@@ -23,6 +23,7 @@
 #include <fmt/core.h>
 
 #include "cache.h" // for CACHE
+#include "cache_stats.h" // for g_llc_stats_csv_path
 #include "champsim.h"
 #ifndef CHAMPSIM_TEST_BUILD
 #include "core_inst.inc"
@@ -62,6 +63,7 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
   long long warmup_instructions = 0;
   long long simulation_instructions = std::numeric_limits<long long>::max();
   std::string json_file_name;
+  std::string csv_output_path;  // CSV output path for LLC stats
   std::vector<std::string> trace_names;
 
   auto set_heartbeat_callback = [&](auto) {
@@ -83,6 +85,8 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
   auto* json_option =
       app.add_option("--json", json_file_name, "The name of the file to receive JSON output. If no name is specified, stdout will be used")->expected(0, 1);
 
+  app.add_option("--csv-output", csv_output_path, "The output path for LLC statistics CSV file (default: llc_stats.csv)");
+
   app.add_option("traces", trace_names, "The paths to the traces")->required()->expected(NUM_CPUS)->check(CLI::ExistingFile);
 
   CLI11_PARSE(app, argc, argv);
@@ -102,6 +106,11 @@ int main(int argc, char** argv) // NOLINT(bugprone-exception-escape)
     // Warmup is 20% by default
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
     warmup_instructions = simulation_instructions / 5;
+  }
+
+  // Set custom CSV output path if provided
+  if (!csv_output_path.empty()) {
+    g_llc_stats_csv_path = csv_output_path;
   }
 
   std::vector<champsim::tracereader> traces;

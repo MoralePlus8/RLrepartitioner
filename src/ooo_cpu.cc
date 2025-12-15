@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <numeric>
 #include <fmt/chrono.h>
 #include <fmt/core.h>
@@ -31,8 +32,6 @@
 #include "util/span.h"
 
 std::chrono::seconds elapsed_time();
-
-constexpr long long STAT_PRINTING_PERIOD = 10000000;
 
 long O3_CPU::operate()
 {
@@ -52,23 +51,157 @@ long O3_CPU::operate()
   progress += check_dib();
   initialize_instruction();
 
-  // heartbeat
-  if (show_heartbeat && (num_retired >= (last_heartbeat_instr + STAT_PRINTING_PERIOD))) {
-    using double_duration = std::chrono::duration<double, typename champsim::chrono::picoseconds::period>;
-    auto heartbeat_instr{std::ceil(num_retired - last_heartbeat_instr)};
-    auto heartbeat_cycle{double_duration{current_time - last_heartbeat_time} / clock_period};
-
-    auto phase_instr{std::ceil(num_retired - begin_phase_instr)};
-    auto phase_cycle{double_duration{current_time - begin_phase_time} / clock_period};
-
-    fmt::print("Heartbeat CPU {} instructions: {} cycles: {} heartbeat IPC: {:.4g} cumulative IPC: {:.4g} (Simulation time: {:%H hr %M min %S sec})\n", cpu,
-               num_retired, current_time.time_since_epoch() / clock_period, heartbeat_instr / heartbeat_cycle, phase_instr / phase_cycle, elapsed_time());
-
-    last_heartbeat_instr = num_retired;
-    last_heartbeat_time = current_time;
-  }
+  // Heartbeat is now triggered globally by cycle count in champsim.cc
+  // Individual CPU heartbeat is disabled to ensure synchronized output across all cores
 
   return progress;
+}
+
+// Heartbeat output function - called externally for synchronized multi-core output
+void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
+{
+  using double_duration = std::chrono::duration<double, typename champsim::chrono::picoseconds::period>;
+  auto heartbeat_instr{std::ceil(static_cast<double>(num_retired - last_heartbeat_instr))};
+  auto heartbeat_cycle{double_duration{current_time - last_heartbeat_time} / clock_period};
+
+  auto phase_instr{std::ceil(static_cast<double>(num_retired - begin_phase_instr))};
+  auto phase_cycle{double_duration{current_time - begin_phase_time} / clock_period};
+
+  double heartbeat_ipc = (heartbeat_cycle > 0) ? (heartbeat_instr / heartbeat_cycle) : 0.0;
+  double phase_ipc = (phase_cycle > 0) ? (phase_instr / phase_cycle) : 0.0;
+
+  fmt::print("Heartbeat CPU {} instructions: {} cycles: {} heartbeat IPC: {:.4g} cumulative IPC: {:.4g} (Simulation time: {:%H hr %M min %S sec})\n", cpu,
+             num_retired, current_time.time_since_epoch() / clock_period, heartbeat_ipc, phase_ipc, elapsed_time());
+
+  // Print LLC access stats for this CPU
+  if (cpu < MAX_CPUS_FOR_COMPETITION) {
+    uint64_t period_accesses = g_llc_stats.accesses[cpu] - g_llc_stats.last_heartbeat_accesses[cpu];
+    uint64_t period_misses = g_llc_stats.misses[cpu] - g_llc_stats.last_heartbeat_misses[cpu];
+    double period_miss_rate = (period_accesses > 0) ? (100.0 * period_misses / period_accesses) : 0.0;
+    double total_miss_rate = (g_llc_stats.accesses[cpu] > 0) ? (100.0 * g_llc_stats.misses[cpu] / g_llc_stats.accesses[cpu]) : 0.0;
+    
+    fmt::print("  LLC Stats CPU {}: accesses: {} (total: {}), misses: {} (total: {}), miss rate: {:.2f}% (total: {:.2f}%)\n",
+               cpu, period_accesses, g_llc_stats.accesses[cpu],
+               period_misses, g_llc_stats.misses[cpu],
+               period_miss_rate, total_miss_rate);
+    
+    // Calculate competition stats (always, for CSV export)
+    uint64_t period_evictions_caused = g_llc_stats.evictions_caused[cpu] - g_llc_stats.last_heartbeat_evictions_caused[cpu];
+    uint64_t period_evicted_by_others = g_llc_stats.evicted_by_others[cpu] - g_llc_stats.last_heartbeat_evicted_by_others[cpu];
+    
+    // Print LLC cache competition stats for this CPU (only when NUM_CPUS > 1)
+    if (NUM_CPUS > 1) {
+      fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {})\n",
+                 cpu, period_evictions_caused, g_llc_stats.evictions_caused[cpu],
+                 period_evicted_by_others, g_llc_stats.evicted_by_others[cpu]);
+    }
+    
+    // Update last heartbeat competition values for this CPU
+    g_llc_stats.last_heartbeat_evictions_caused[cpu] = g_llc_stats.evictions_caused[cpu];
+    g_llc_stats.last_heartbeat_evicted_by_others[cpu] = g_llc_stats.evicted_by_others[cpu];
+    
+    // Print cache line lifetime statistics
+    uint64_t period_total_lifetime = g_llc_stats.total_lifetime_cycles[cpu] - g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu];
+    uint64_t period_eviction_count = g_llc_stats.eviction_count[cpu] - g_llc_stats.last_heartbeat_eviction_count[cpu];
+    double period_avg_lifetime = (period_eviction_count > 0) ? (static_cast<double>(period_total_lifetime) / period_eviction_count) : 0.0;
+    double total_avg_lifetime = (g_llc_stats.eviction_count[cpu] > 0) ? 
+        (static_cast<double>(g_llc_stats.total_lifetime_cycles[cpu]) / g_llc_stats.eviction_count[cpu]) : 0.0;
+    
+    fmt::print("  LLC Lifetime CPU {}: period avg: {:.2f} cycles, total avg: {:.2f} cycles (evictions: {} / {})\n",
+               cpu, period_avg_lifetime, total_avg_lifetime,
+               period_eviction_count, g_llc_stats.eviction_count[cpu]);
+    
+    // Update last heartbeat lifetime values for this CPU
+    g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu] = g_llc_stats.total_lifetime_cycles[cpu];
+    g_llc_stats.last_heartbeat_eviction_count[cpu] = g_llc_stats.eviction_count[cpu];
+    
+    // Print total evictions caused by this CPU (includes both self and other cores' cache lines)
+    uint64_t period_total_evictions_caused = g_llc_stats.total_evictions_caused[cpu] - g_llc_stats.last_heartbeat_total_evictions_caused[cpu];
+    fmt::print("  LLC Total Evictions Caused CPU {}: period: {} (total: {})\n",
+               cpu, period_total_evictions_caused, g_llc_stats.total_evictions_caused[cpu]);
+    
+    // Update last heartbeat total evictions caused values for this CPU
+    g_llc_stats.last_heartbeat_total_evictions_caused[cpu] = g_llc_stats.total_evictions_caused[cpu];
+    
+    // Print way occupancy statistics
+    uint64_t period_way_samples = g_llc_stats.way_occupancy_samples[cpu] - g_llc_stats.last_heartbeat_way_occupancy_samples[cpu];
+    uint64_t period_sample_count = g_llc_stats.way_occupancy_sample_count - g_llc_stats.last_heartbeat_way_occupancy_sample_count;
+    double period_avg_ways = (period_sample_count > 0) ? (static_cast<double>(period_way_samples) / period_sample_count) : 0.0;
+    double total_avg_ways = (g_llc_stats.way_occupancy_sample_count > 0) ? 
+        (static_cast<double>(g_llc_stats.way_occupancy_samples[cpu]) / g_llc_stats.way_occupancy_sample_count) : 0.0;
+    
+    fmt::print("  LLC Way Occupancy CPU {}: period avg: {:.2f} lines, total avg: {:.2f} lines\n",
+               cpu, period_avg_ways, total_avg_ways);
+    
+    // Calculate lifetime using Little's Law: W = L × T / λ
+    // Where: W = average lifetime, L = average occupancy, T = period cycles, λ = fill count
+    // This avoids tracking individual cache line fill times
+    uint64_t period_fill_count = g_llc_stats.fill_count[cpu] - g_llc_stats.last_heartbeat_fill_count[cpu];
+    double little_law_lifetime = 0.0;
+    if (period_fill_count > 0) {
+      // W = L × T / λ = period_avg_ways × heartbeat_cycle / period_fill_count
+      little_law_lifetime = period_avg_ways * heartbeat_cycle / period_fill_count;
+    }
+    
+    fmt::print("  LLC Little's Law Lifetime CPU {}: estimated avg: {:.2f} cycles (L={:.2f}, fills={})\n",
+               cpu, little_law_lifetime, period_avg_ways, period_fill_count);
+    
+    // Update last heartbeat fill count for this CPU
+    g_llc_stats.last_heartbeat_fill_count[cpu] = g_llc_stats.fill_count[cpu];
+    
+    // Update last heartbeat way occupancy values for this CPU
+    g_llc_stats.last_heartbeat_way_occupancy_samples[cpu] = g_llc_stats.way_occupancy_samples[cpu];
+    
+    // Update last heartbeat access values for this CPU
+    g_llc_stats.last_heartbeat_accesses[cpu] = g_llc_stats.accesses[cpu];
+    g_llc_stats.last_heartbeat_misses[cpu] = g_llc_stats.misses[cpu];
+
+    // Export statistics to CSV file
+    {
+      std::ofstream csv_file;
+      if (!g_llc_stats_csv_header_written) {
+        // First write: create file and write header
+        csv_file.open(g_llc_stats_csv_path, std::ios::out | std::ios::trunc);
+        if (csv_file.is_open()) {
+          csv_file << "heartbeat,cpu,global_cycle,cpu_cycle,instructions,ipc,"
+                   << "period_accesses,period_misses,period_miss_rate,"
+                   << "period_evictions_caused,period_evicted_by_others,"
+                   << "period_avg_lifetime_cycles,period_eviction_count,"
+                   << "period_avg_way_occupancy,period_total_evictions_caused,"
+                   << "little_law_lifetime,period_fill_count\n";
+          g_llc_stats_csv_header_written = true;
+        }
+      } else {
+        // Subsequent writes: append to file
+        csv_file.open(g_llc_stats_csv_path, std::ios::out | std::ios::app);
+      }
+      
+      if (csv_file.is_open()) {
+        csv_file << heartbeat_count << ","
+                 << cpu << ","
+                 << global_cycle << ","
+                 << (current_time.time_since_epoch() / clock_period) << ","
+                 << num_retired << ","
+                 << heartbeat_ipc << ","
+                 << period_accesses << ","
+                 << period_misses << ","
+                 << period_miss_rate << ","
+                 << period_evictions_caused << ","
+                 << period_evicted_by_others << ","
+                 << period_avg_lifetime << ","
+                 << period_eviction_count << ","
+                 << period_avg_ways << ","
+                 << period_total_evictions_caused << ","
+                 << little_law_lifetime << ","
+                 << period_fill_count << "\n";
+        csv_file.close();
+      }
+    }
+  }
+
+  // Update last heartbeat values
+  last_heartbeat_instr = num_retired;
+  last_heartbeat_time = current_time;
 }
 
 void O3_CPU::initialize()

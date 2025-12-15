@@ -126,7 +126,7 @@ public:
   using BLOCK = champsim::cache_block;
 
 private:
-  static BLOCK fill_block(mshr_type mshr, uint32_t metadata);
+  static BLOCK fill_block(mshr_type mshr, uint32_t metadata, uint64_t current_cycle);
   using set_type = std::vector<BLOCK>;
 
   std::pair<set_type::iterator, set_type::iterator> get_set_span(champsim::address address);
@@ -171,11 +171,6 @@ public:
   using stats_type = cache_stats;
 
   stats_type sim_stats, roi_stats;
-
-  // Heartbeat tracking for LLC competition stats
-  champsim::chrono::clock::time_point last_heartbeat_time{};
-  std::vector<uint64_t> last_heartbeat_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
-  std::vector<uint64_t> last_heartbeat_evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
 
   std::deque<mshr_type> MSHR;
   std::deque<mshr_type> inflight_writes;

@@ -31,6 +31,14 @@ long partition::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set
   long partition_start = partition_left_margins[triggering_cpu];
   long partition_end = partition_left_margins[triggering_cpu + 1];
   
+  // 首先在分区内查找无效way（解决初始填充阶段跨分区问题）
+  for (long w = partition_start; w < partition_end; w++) {
+    if (!current_set[w].valid) {
+      return w;
+    }
+  }
+  
+  // 如果分区内没有无效way，使用LRU策略在分区内选择victim
   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_start);
   auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_end);
 
@@ -38,7 +46,8 @@ long partition::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set
   auto victim = std::min_element(begin, end);
   assert(begin <= victim);
   assert(victim < end);
-  return std::distance(begin, victim);
+  // 返回实际的 way 索引，而不是相对于分区起始位置的偏移量
+  return partition_start + std::distance(begin, victim);
 }
 
 void partition::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
