@@ -38,7 +38,8 @@ long partition::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set
   auto victim = std::min_element(begin, end);
   assert(begin <= victim);
   assert(victim < end);
-  return std::distance(begin, victim);
+  // 返回实际的 way 索引，而不是相对于分区起始位置的偏移量
+  return partition_start + std::distance(begin, victim);
 }
 
 void partition::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
