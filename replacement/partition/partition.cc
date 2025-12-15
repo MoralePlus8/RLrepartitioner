@@ -1,6 +1,7 @@
 #include "partition.h"
 #include <algorithm>
 #include <cassert>
+#include <iostream>
 #include "champsim.h"
 
 partition::partition(CACHE* cache) : partition(cache, cache->NUM_SET, cache->NUM_WAY) {}
@@ -19,6 +20,7 @@ void partition::initialize_replacement(){
       partition_left_margins[i] = static_cast<long>(i) * init_partition_ways;
     }
     partition_left_margins[NUM_CPUS] = NUM_WAY;
+    std::cout << "partition_strategy_initialized" << std::endl;
 }
   
 

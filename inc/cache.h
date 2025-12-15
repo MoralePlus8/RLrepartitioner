@@ -172,6 +172,11 @@ public:
 
   stats_type sim_stats, roi_stats;
 
+  // Heartbeat tracking for LLC competition stats
+  champsim::chrono::clock::time_point last_heartbeat_time{};
+  std::vector<uint64_t> last_heartbeat_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  std::vector<uint64_t> last_heartbeat_evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
   std::deque<mshr_type> MSHR;
   std::deque<mshr_type> inflight_writes;
 

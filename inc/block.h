@@ -31,6 +31,7 @@ struct cache_block {
   champsim::address data{};
 
   uint32_t pf_metadata = 0;
+  uint32_t cpu = 0;  // CPU that owns this cache block
 };
 } // namespace champsim
 

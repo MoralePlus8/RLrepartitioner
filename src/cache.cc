@@ -148,6 +148,7 @@ auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
   to_fill.v_address = mshr.v_address;
   to_fill.data = mshr.data_promise->data;
   to_fill.pf_metadata = metadata;
+  to_fill.cpu = mshr.cpu;  // Record which CPU owns this cache block
 
   return to_fill;
 }
@@ -229,6 +230,21 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
     if (fill_mshr.type == access_type::PREFETCH) {
       ++sim_stats.pf_fill;
+    }
+
+    // Track cache competition: when one core evicts another core's cache line
+    if (way->valid && NUM_CPUS > 1) {
+      uint32_t evicting_cpu = fill_mshr.cpu;
+      uint32_t evicted_cpu = way->cpu;
+      if (evicting_cpu != evicted_cpu) {
+        // CPU evicting_cpu caused an eviction of CPU evicted_cpu's cache line
+        if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
+          ++sim_stats.evictions_caused[evicting_cpu];
+        }
+        if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
+          ++sim_stats.evicted_by_others[evicted_cpu];
+        }
+      }
     }
 
     *way = fill_block(fill_mshr, metadata_thru);
@@ -412,6 +428,9 @@ auto CACHE::initiate_tag_check(champsim::channel* ul)
   };
 }
 
+// Heartbeat period for LLC competition stats (in cycles)
+constexpr long long LLC_HEARTBEAT_PERIOD = 10000000;
+
 long CACHE::operate()
 {
   long progress{0};
@@ -425,6 +444,33 @@ long CACHE::operate()
 
   for (auto* ul : upper_levels) {
     ul->check_collision();
+  }
+
+  // LLC competition heartbeat: print stats every LLC_HEARTBEAT_PERIOD cycles
+  if (NAME == "LLC" && NUM_CPUS > 1) {
+    using double_duration = std::chrono::duration<double, typename champsim::chrono::picoseconds::period>;
+    auto cycles_since_heartbeat = double_duration{current_time - last_heartbeat_time} / clock_period;
+    
+    if (cycles_since_heartbeat >= LLC_HEARTBEAT_PERIOD) {
+      fmt::print("\n=== LLC Cache Competition Heartbeat (cycle: {}) ===\n", 
+                 current_time.time_since_epoch() / clock_period);
+      
+      for (std::size_t cpu = 0; cpu < NUM_CPUS && cpu < MAX_CPUS_FOR_COMPETITION; ++cpu) {
+        uint64_t period_evictions_caused = sim_stats.evictions_caused[cpu] - last_heartbeat_evictions_caused[cpu];
+        uint64_t period_evicted_by_others = sim_stats.evicted_by_others[cpu] - last_heartbeat_evicted_by_others[cpu];
+        
+        fmt::print("  CPU {}: evicted others' lines: {} (total: {}), own lines evicted by others: {} (total: {})\n",
+                   cpu, period_evictions_caused, sim_stats.evictions_caused[cpu],
+                   period_evicted_by_others, sim_stats.evicted_by_others[cpu]);
+        
+        // Update last heartbeat values
+        last_heartbeat_evictions_caused[cpu] = sim_stats.evictions_caused[cpu];
+        last_heartbeat_evicted_by_others[cpu] = sim_stats.evicted_by_others[cpu];
+      }
+      fmt::print("================================================\n\n");
+      
+      last_heartbeat_time = current_time;
+    }
   }
 
   // Finish returns
