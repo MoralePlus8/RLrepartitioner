@@ -31,6 +31,14 @@ long partition::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set
   long partition_start = partition_left_margins[triggering_cpu];
   long partition_end = partition_left_margins[triggering_cpu + 1];
   
+  // 首先在分区内查找无效way（解决初始填充阶段跨分区问题）
+  for (long w = partition_start; w < partition_end; w++) {
+    if (!current_set[w].valid) {
+      return w;
+    }
+  }
+  
+  // 如果分区内没有无效way，使用LRU策略在分区内选择victim
   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_start);
   auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_end);
 

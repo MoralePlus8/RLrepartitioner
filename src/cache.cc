@@ -171,13 +171,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 {
   cpu = fill_mshr.cpu;
 
-  // find victim
+  // find victim - let the replacement policy decide (including finding invalid ways)
+  // This ensures partitioning strategies can enforce partition boundaries even during initial fill
   auto [set_begin, set_end] = get_set_span(fill_mshr.address);
-  auto way = std::find_if_not(set_begin, set_end, [](auto x) { return x.valid; });
-  if (way == set_end) {
-    way = std::next(set_begin, impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip,
-                                                fill_mshr.address, fill_mshr.type));
-  }
+  auto way = std::next(set_begin, impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip,
+                                                   fill_mshr.address, fill_mshr.type));
   assert(set_begin <= way);
   assert(way <= set_end);
   assert(way != set_end || fill_mshr.type != access_type::WRITE); // Writes may not bypass
@@ -239,10 +237,10 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
       if (evicting_cpu != evicted_cpu) {
         // CPU evicting_cpu caused an eviction of CPU evicted_cpu's cache line
         if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
-          ++g_llc_competition.evictions_caused[evicting_cpu];
+          ++g_llc_stats.evictions_caused[evicting_cpu];
         }
         if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
-          ++g_llc_competition.evicted_by_others[evicted_cpu];
+          ++g_llc_stats.evicted_by_others[evicted_cpu];
         }
       }
     }
@@ -266,6 +264,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
 {
   cpu = handle_pkt.cpu;
+
+  // Track LLC access stats per CPU
+  if (NAME == "LLC" && handle_pkt.cpu < MAX_CPUS_FOR_COMPETITION) {
+    ++g_llc_stats.accesses[handle_pkt.cpu];
+  }
 
   // access cache
   auto [set_begin, set_end] = get_set_span(handle_pkt.address);
@@ -384,6 +387,11 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
+  // Track LLC miss stats per CPU
+  if (NAME == "LLC" && handle_pkt.cpu < MAX_CPUS_FOR_COMPETITION) {
+    ++g_llc_stats.misses[handle_pkt.cpu];
+  }
+
   return true;
 }
 
@@ -428,8 +436,8 @@ auto CACHE::initiate_tag_check(champsim::channel* ul)
   };
 }
 
-// Global LLC competition stats instance
-llc_competition_stats g_llc_competition;
+// Global LLC stats instance
+llc_stats g_llc_stats;
 
 long CACHE::operate()
 {

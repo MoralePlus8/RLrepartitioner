@@ -64,18 +64,35 @@ long O3_CPU::operate()
     fmt::print("Heartbeat CPU {} instructions: {} cycles: {} heartbeat IPC: {:.4g} cumulative IPC: {:.4g} (Simulation time: {:%H hr %M min %S sec})\n", cpu,
                num_retired, current_time.time_since_epoch() / clock_period, heartbeat_instr / heartbeat_cycle, phase_instr / phase_cycle, elapsed_time());
 
-    // Print LLC cache competition stats for this CPU (only when NUM_CPUS > 1)
-    if (NUM_CPUS > 1 && cpu < MAX_CPUS_FOR_COMPETITION) {
-      uint64_t period_evictions_caused = g_llc_competition.evictions_caused[cpu] - g_llc_competition.last_heartbeat_evictions_caused[cpu];
-      uint64_t period_evicted_by_others = g_llc_competition.evicted_by_others[cpu] - g_llc_competition.last_heartbeat_evicted_by_others[cpu];
+    // Print LLC access stats for this CPU
+    if (cpu < MAX_CPUS_FOR_COMPETITION) {
+      uint64_t period_accesses = g_llc_stats.accesses[cpu] - g_llc_stats.last_heartbeat_accesses[cpu];
+      uint64_t period_misses = g_llc_stats.misses[cpu] - g_llc_stats.last_heartbeat_misses[cpu];
+      double period_miss_rate = (period_accesses > 0) ? (100.0 * period_misses / period_accesses) : 0.0;
+      double total_miss_rate = (g_llc_stats.accesses[cpu] > 0) ? (100.0 * g_llc_stats.misses[cpu] / g_llc_stats.accesses[cpu]) : 0.0;
       
-      fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {})\n",
-                 cpu, period_evictions_caused, g_llc_competition.evictions_caused[cpu],
-                 period_evicted_by_others, g_llc_competition.evicted_by_others[cpu]);
+      fmt::print("  LLC Stats CPU {}: accesses: {} (total: {}), misses: {} (total: {}), miss rate: {:.2f}% (total: {:.2f}%)\n",
+                 cpu, period_accesses, g_llc_stats.accesses[cpu],
+                 period_misses, g_llc_stats.misses[cpu],
+                 period_miss_rate, total_miss_rate);
       
-      // Update last heartbeat values for this CPU
-      g_llc_competition.last_heartbeat_evictions_caused[cpu] = g_llc_competition.evictions_caused[cpu];
-      g_llc_competition.last_heartbeat_evicted_by_others[cpu] = g_llc_competition.evicted_by_others[cpu];
+      // Print LLC cache competition stats for this CPU (only when NUM_CPUS > 1)
+      if (NUM_CPUS > 1) {
+        uint64_t period_evictions_caused = g_llc_stats.evictions_caused[cpu] - g_llc_stats.last_heartbeat_evictions_caused[cpu];
+        uint64_t period_evicted_by_others = g_llc_stats.evicted_by_others[cpu] - g_llc_stats.last_heartbeat_evicted_by_others[cpu];
+        
+        fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {})\n",
+                   cpu, period_evictions_caused, g_llc_stats.evictions_caused[cpu],
+                   period_evicted_by_others, g_llc_stats.evicted_by_others[cpu]);
+        
+        // Update last heartbeat competition values for this CPU
+        g_llc_stats.last_heartbeat_evictions_caused[cpu] = g_llc_stats.evictions_caused[cpu];
+        g_llc_stats.last_heartbeat_evicted_by_others[cpu] = g_llc_stats.evicted_by_others[cpu];
+      }
+      
+      // Update last heartbeat access values for this CPU
+      g_llc_stats.last_heartbeat_accesses[cpu] = g_llc_stats.accesses[cpu];
+      g_llc_stats.last_heartbeat_misses[cpu] = g_llc_stats.misses[cpu];
     }
 
     last_heartbeat_instr = num_retired;

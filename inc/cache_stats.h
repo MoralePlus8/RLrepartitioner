@@ -13,17 +13,25 @@
 // Maximum number of CPUs supported for competition tracking
 constexpr std::size_t MAX_CPUS_FOR_COMPETITION = 16;
 
-// Global LLC competition stats structure for access from CPU heartbeat
-struct llc_competition_stats {
+// Global LLC stats structure for access from CPU heartbeat
+struct llc_stats {
+  // Cache competition stats
   std::vector<uint64_t> evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
-  // Last heartbeat values for computing per-period stats
+  // Last heartbeat values for computing per-period competition stats
   std::vector<uint64_t> last_heartbeat_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> last_heartbeat_evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
+  // LLC access stats per CPU
+  std::vector<uint64_t> accesses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Total LLC accesses per CPU
+  std::vector<uint64_t> misses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);    // LLC misses per CPU
+  // Last heartbeat values for computing per-period access stats
+  std::vector<uint64_t> last_heartbeat_accesses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  std::vector<uint64_t> last_heartbeat_misses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
 };
 
-// Global LLC competition stats instance (defined in cache.cc)
-extern llc_competition_stats g_llc_competition;
+// Global LLC stats instance (defined in cache.cc)
+extern llc_stats g_llc_stats;
 
 struct cache_stats {
   std::string name;
