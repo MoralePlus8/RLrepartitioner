@@ -138,7 +138,7 @@ CACHE::mshr_type CACHE::mshr_type::merge(mshr_type predecessor, mshr_type succes
   return retval;
 }
 
-auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
+auto CACHE::fill_block(mshr_type mshr, uint32_t metadata, uint64_t current_cycle) -> BLOCK
 {
   CACHE::BLOCK to_fill;
   to_fill.valid = true;
@@ -149,6 +149,7 @@ auto CACHE::fill_block(mshr_type mshr, uint32_t metadata) -> BLOCK
   to_fill.data = mshr.data_promise->data;
   to_fill.pf_metadata = metadata;
   to_fill.cpu = mshr.cpu;  // Record which CPU owns this cache block
+  to_fill.fill_cycle = current_cycle;  // Record which cycle this cache line was filled
 
   return to_fill;
 }
@@ -245,7 +246,19 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
       }
     }
 
-    *way = fill_block(fill_mshr, metadata_thru);
+    // Track cache line lifetime statistics (LLC only)
+    if (way->valid && NAME == "LLC") {
+      uint32_t evicted_cpu = way->cpu;
+      if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
+        // Calculate the lifetime of this cache line in cycles (directly subtract cycle numbers)
+        uint64_t current_cycle = current_time.time_since_epoch() / clock_period;
+        uint64_t lifetime_cycles = current_cycle - way->fill_cycle;
+        g_llc_stats.total_lifetime_cycles[evicted_cpu] += lifetime_cycles;
+        ++g_llc_stats.eviction_count[evicted_cpu];
+      }
+    }
+
+    *way = fill_block(fill_mshr, metadata_thru, current_time.time_since_epoch() / clock_period);
   }
 
   // COLLECT STATS
@@ -439,6 +452,10 @@ auto CACHE::initiate_tag_check(champsim::channel* ul)
 // Global LLC stats instance
 llc_stats g_llc_stats;
 
+// CSV export globals
+std::string g_llc_stats_csv_path = "llc_stats.csv";
+bool g_llc_stats_csv_header_written = false;
+
 long CACHE::operate()
 {
   long progress{0};
@@ -541,6 +558,26 @@ long CACHE::operate()
   inflight_tag_check.erase(tag_check_ready_begin, finish_tag_check_end);
 
   impl_prefetcher_cycle_operate();
+
+  // Sample way occupancy statistics for LLC (sample every 10000 cycles to reduce overhead)
+  if (NAME == "LLC") {
+    constexpr uint64_t WAY_OCCUPANCY_SAMPLE_INTERVAL = 10000;
+    uint64_t current_cycle = current_time.time_since_epoch() / clock_period;
+    if (current_cycle % WAY_OCCUPANCY_SAMPLE_INTERVAL == 0) {
+      // Count how many valid cache lines each CPU owns
+      std::vector<uint64_t> cpu_way_count(MAX_CPUS_FOR_COMPETITION, 0);
+      for (const auto& blk : block) {
+        if (blk.valid && blk.cpu < MAX_CPUS_FOR_COMPETITION) {
+          ++cpu_way_count[blk.cpu];
+        }
+      }
+      // Add to cumulative samples
+      for (std::size_t i = 0; i < MAX_CPUS_FOR_COMPETITION; ++i) {
+        g_llc_stats.way_occupancy_samples[i] += cpu_way_count[i];
+      }
+      ++g_llc_stats.way_occupancy_sample_count;
+    }
+  }
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} cycle completed: {} tags checked: {} remaining: {} stash consumed: {} remaining: {} channel consumed: {} pq consumed {} unused consume "

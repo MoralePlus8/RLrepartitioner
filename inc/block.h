@@ -17,6 +17,8 @@
 #ifndef BLOCK_H
 #define BLOCK_H
 
+#include <cstdint>
+
 #include "champsim.h"
 
 namespace champsim
@@ -32,6 +34,9 @@ struct cache_block {
 
   uint32_t pf_metadata = 0;
   uint32_t cpu = 0;  // CPU that owns this cache block
+  
+  // Track which cycle this cache line was filled (for lifetime statistics)
+  uint64_t fill_cycle = 0;
 };
 } // namespace champsim
 

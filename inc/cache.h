@@ -126,7 +126,7 @@ public:
   using BLOCK = champsim::cache_block;
 
 private:
-  static BLOCK fill_block(mshr_type mshr, uint32_t metadata);
+  static BLOCK fill_block(mshr_type mshr, uint32_t metadata, uint64_t current_cycle);
   using set_type = std::vector<BLOCK>;
 
   std::pair<set_type::iterator, set_type::iterator> get_set_span(champsim::address address);

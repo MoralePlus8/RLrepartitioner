@@ -2,6 +2,7 @@
 #define CACHE_STATS_H
 
 #include <cstdint>
+#include <fstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -12,6 +13,11 @@
 
 // Maximum number of CPUs supported for competition tracking
 constexpr std::size_t MAX_CPUS_FOR_COMPETITION = 16;
+
+// CSV export file path (can be set before simulation starts)
+extern std::string g_llc_stats_csv_path;
+// Flag to track if CSV header has been written
+extern bool g_llc_stats_csv_header_written;
 
 // Global LLC stats structure for access from CPU heartbeat
 struct llc_stats {
@@ -28,6 +34,21 @@ struct llc_stats {
   // Last heartbeat values for computing per-period access stats
   std::vector<uint64_t> last_heartbeat_accesses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> last_heartbeat_misses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
+  // Cache line lifetime statistics (cycles until eviction)
+  std::vector<uint64_t> total_lifetime_cycles = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Sum of all lifetime cycles per CPU
+  std::vector<uint64_t> eviction_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);          // Number of evictions per CPU
+  // Last heartbeat values for computing per-period lifetime stats
+  std::vector<uint64_t> last_heartbeat_total_lifetime_cycles = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  std::vector<uint64_t> last_heartbeat_eviction_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
+  // Way occupancy statistics - tracks how many ways each CPU occupies
+  // These are snapshots that can be updated periodically
+  std::vector<uint64_t> way_occupancy_samples = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Sum of way counts in samples
+  uint64_t way_occupancy_sample_count = 0;  // Number of samples taken
+  // Last heartbeat values for computing per-period way occupancy
+  std::vector<uint64_t> last_heartbeat_way_occupancy_samples = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  uint64_t last_heartbeat_way_occupancy_sample_count = 0;
 };
 
 // Global LLC stats instance (defined in cache.cc)

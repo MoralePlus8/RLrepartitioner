@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <numeric>
 #include <fmt/chrono.h>
 #include <fmt/core.h>
@@ -29,6 +30,9 @@
 #include "deadlock.h"
 #include "instruction.h"
 #include "util/span.h"
+
+// Heartbeat counter for CSV export
+static uint64_t g_heartbeat_count = 0;
 
 std::chrono::seconds elapsed_time();
 
@@ -76,23 +80,97 @@ long O3_CPU::operate()
                  period_misses, g_llc_stats.misses[cpu],
                  period_miss_rate, total_miss_rate);
       
+      // Calculate competition stats (always, for CSV export)
+      uint64_t period_evictions_caused = g_llc_stats.evictions_caused[cpu] - g_llc_stats.last_heartbeat_evictions_caused[cpu];
+      uint64_t period_evicted_by_others = g_llc_stats.evicted_by_others[cpu] - g_llc_stats.last_heartbeat_evicted_by_others[cpu];
+      
       // Print LLC cache competition stats for this CPU (only when NUM_CPUS > 1)
       if (NUM_CPUS > 1) {
-        uint64_t period_evictions_caused = g_llc_stats.evictions_caused[cpu] - g_llc_stats.last_heartbeat_evictions_caused[cpu];
-        uint64_t period_evicted_by_others = g_llc_stats.evicted_by_others[cpu] - g_llc_stats.last_heartbeat_evicted_by_others[cpu];
-        
         fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {})\n",
                    cpu, period_evictions_caused, g_llc_stats.evictions_caused[cpu],
                    period_evicted_by_others, g_llc_stats.evicted_by_others[cpu]);
-        
-        // Update last heartbeat competition values for this CPU
-        g_llc_stats.last_heartbeat_evictions_caused[cpu] = g_llc_stats.evictions_caused[cpu];
-        g_llc_stats.last_heartbeat_evicted_by_others[cpu] = g_llc_stats.evicted_by_others[cpu];
+      }
+      
+      // Update last heartbeat competition values for this CPU
+      g_llc_stats.last_heartbeat_evictions_caused[cpu] = g_llc_stats.evictions_caused[cpu];
+      g_llc_stats.last_heartbeat_evicted_by_others[cpu] = g_llc_stats.evicted_by_others[cpu];
+      
+      // Print cache line lifetime statistics
+      uint64_t period_total_lifetime = g_llc_stats.total_lifetime_cycles[cpu] - g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu];
+      uint64_t period_eviction_count = g_llc_stats.eviction_count[cpu] - g_llc_stats.last_heartbeat_eviction_count[cpu];
+      double period_avg_lifetime = (period_eviction_count > 0) ? (static_cast<double>(period_total_lifetime) / period_eviction_count) : 0.0;
+      double total_avg_lifetime = (g_llc_stats.eviction_count[cpu] > 0) ? 
+          (static_cast<double>(g_llc_stats.total_lifetime_cycles[cpu]) / g_llc_stats.eviction_count[cpu]) : 0.0;
+      
+      fmt::print("  LLC Lifetime CPU {}: period avg: {:.2f} cycles, total avg: {:.2f} cycles (evictions: {} / {})\n",
+                 cpu, period_avg_lifetime, total_avg_lifetime,
+                 period_eviction_count, g_llc_stats.eviction_count[cpu]);
+      
+      // Update last heartbeat lifetime values for this CPU
+      g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu] = g_llc_stats.total_lifetime_cycles[cpu];
+      g_llc_stats.last_heartbeat_eviction_count[cpu] = g_llc_stats.eviction_count[cpu];
+      
+      // Print way occupancy statistics
+      uint64_t period_way_samples = g_llc_stats.way_occupancy_samples[cpu] - g_llc_stats.last_heartbeat_way_occupancy_samples[cpu];
+      uint64_t period_sample_count = g_llc_stats.way_occupancy_sample_count - g_llc_stats.last_heartbeat_way_occupancy_sample_count;
+      double period_avg_ways = (period_sample_count > 0) ? (static_cast<double>(period_way_samples) / period_sample_count) : 0.0;
+      double total_avg_ways = (g_llc_stats.way_occupancy_sample_count > 0) ? 
+          (static_cast<double>(g_llc_stats.way_occupancy_samples[cpu]) / g_llc_stats.way_occupancy_sample_count) : 0.0;
+      
+      fmt::print("  LLC Way Occupancy CPU {}: period avg: {:.2f} lines, total avg: {:.2f} lines\n",
+                 cpu, period_avg_ways, total_avg_ways);
+      
+      // Update last heartbeat way occupancy values for this CPU (only update sample count once per all CPUs)
+      g_llc_stats.last_heartbeat_way_occupancy_samples[cpu] = g_llc_stats.way_occupancy_samples[cpu];
+      if (cpu == 0) {
+        g_llc_stats.last_heartbeat_way_occupancy_sample_count = g_llc_stats.way_occupancy_sample_count;
       }
       
       // Update last heartbeat access values for this CPU
       g_llc_stats.last_heartbeat_accesses[cpu] = g_llc_stats.accesses[cpu];
       g_llc_stats.last_heartbeat_misses[cpu] = g_llc_stats.misses[cpu];
+
+      // Export statistics to CSV file
+      {
+        std::ofstream csv_file;
+        if (!g_llc_stats_csv_header_written) {
+          // First write: create file and write header
+          csv_file.open(g_llc_stats_csv_path, std::ios::out | std::ios::trunc);
+          if (csv_file.is_open()) {
+            csv_file << "heartbeat,cpu,cycle,instructions,ipc,"
+                     << "period_accesses,period_misses,period_miss_rate,"
+                     << "period_evictions_caused,period_evicted_by_others,"
+                     << "period_avg_lifetime_cycles,period_eviction_count,"
+                     << "period_avg_way_occupancy\n";
+            g_llc_stats_csv_header_written = true;
+          }
+        } else {
+          // Subsequent writes: append to file
+          csv_file.open(g_llc_stats_csv_path, std::ios::out | std::ios::app);
+        }
+        
+        if (csv_file.is_open()) {
+          csv_file << g_heartbeat_count << ","
+                   << cpu << ","
+                   << (current_time.time_since_epoch() / clock_period) << ","
+                   << num_retired << ","
+                   << (heartbeat_instr / heartbeat_cycle) << ","
+                   << period_accesses << ","
+                   << period_misses << ","
+                   << period_miss_rate << ","
+                   << period_evictions_caused << ","
+                   << period_evicted_by_others << ","
+                   << period_avg_lifetime << ","
+                   << period_eviction_count << ","
+                   << period_avg_ways << "\n";
+          csv_file.close();
+        }
+      }
+    }
+
+    // Increment heartbeat counter (once per heartbeat, not per CPU)
+    if (cpu == 0) {
+      ++g_heartbeat_count;
     }
 
     last_heartbeat_instr = num_retired;
