@@ -1,8 +1,0 @@
-Package: catch2
-Version: 3.6.0
-Depends: vcpkg-cmake, vcpkg-cmake-config
-Architecture: arm64-osx
-Multi-Arch: same
-Abi: 50aa77f4803c1105de546ad9e2ac0f9743fbc5bd7dd013ea7fe32f7c9c3e8b8c
-Description: A modern, C++-native, test framework for unit-tests, TDD and BDD.
-Status: install ok half-installed

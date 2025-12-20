@@ -1,0 +1,6 @@
+bin/
+.csconfig/
+.vscode/
+.idea/
+stats/
+/vcpkg_installed/
