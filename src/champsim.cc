@@ -23,6 +23,7 @@
 #include <fmt/chrono.h>
 #include <fmt/core.h>
 
+#include "cache_stats.h"
 #include "environment.h"
 #include "ooo_cpu.h"
 #include "operable.h"
@@ -30,6 +31,9 @@
 #include "tracereader.h"
 
 constexpr int DEADLOCK_CYCLE{500};
+
+// Cycle-based heartbeat period (default: 10 million cycles)
+constexpr uint64_t HEARTBEAT_CYCLE_PERIOD = 5000000;
 
 const auto start_time = std::chrono::steady_clock::now();
 
@@ -81,6 +85,11 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
   std::vector<double> livelock_threshold{0.01, 0.02, 0.05};
   std::vector<uint64_t> livelock_instr(std::size(env.cpu_view()), 0);
 
+  // Cycle-based heartbeat tracking
+  uint64_t heartbeat_count = 0;
+  uint64_t last_heartbeat_cycle = 0;
+  uint64_t phase_start_cycle = global_clock.now().time_since_epoch() / time_quantum;
+
   // Perform phase
   int stalled_cycle{0};
   std::vector<bool> phase_complete(std::size(env.cpu_view()), false);
@@ -89,6 +98,30 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     global_clock.tick(time_quantum);
 
     auto progress = do_cycle(env, traces, trace_index, global_clock);
+    
+    // Calculate current global cycle (relative to phase start)
+    uint64_t current_cycle = global_clock.now().time_since_epoch() / time_quantum;
+    uint64_t phase_cycle = current_cycle - phase_start_cycle;
+    
+    // Cycle-based heartbeat: trigger when we've passed the next heartbeat threshold
+    if (phase_cycle >= last_heartbeat_cycle + HEARTBEAT_CYCLE_PERIOD) {
+      // Print heartbeat header
+      fmt::print("\n=== Cycle-based Heartbeat {} at global cycle {} (phase cycle {}) ===\n",
+                 heartbeat_count, current_cycle, phase_cycle);
+      
+      // Print heartbeat for all CPUs simultaneously
+      for (O3_CPU& cpu : env.cpu_view()) {
+        cpu.print_heartbeat(heartbeat_count, current_cycle);
+      }
+      
+      // Update way occupancy sample count after all CPUs have printed
+      g_llc_stats.last_heartbeat_way_occupancy_sample_count = g_llc_stats.way_occupancy_sample_count;
+      
+      fmt::print("=== End Heartbeat {} ===\n\n", heartbeat_count);
+      
+      ++heartbeat_count;
+      last_heartbeat_cycle = phase_cycle;
+    }
 
     if (progress == 0) {
       ++stalled_cycle;
