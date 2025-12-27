@@ -248,7 +248,14 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
     // Track cache line lifetime statistics (LLC only)
     if (way->valid && NAME == "LLC") {
+      uint32_t evicting_cpu = fill_mshr.cpu;
       uint32_t evicted_cpu = way->cpu;
+      
+      // Track total evictions caused by each CPU (includes both self and other cores' cache lines)
+      if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
+        ++g_llc_stats.total_evictions_caused[evicting_cpu];
+      }
+      
       if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
         // Calculate the lifetime of this cache line in cycles (directly subtract cycle numbers)
         uint64_t current_cycle = current_time.time_since_epoch() / clock_period;
@@ -259,6 +266,11 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
     }
 
     *way = fill_block(fill_mshr, metadata_thru, current_time.time_since_epoch() / clock_period);
+    
+    // Track fill count for Little's Law calculation (LLC only)
+    if (NAME == "LLC" && fill_mshr.cpu < MAX_CPUS_FOR_COMPETITION) {
+      ++g_llc_stats.fill_count[fill_mshr.cpu];
+    }
   }
 
   // COLLECT STATS

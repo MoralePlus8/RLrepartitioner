@@ -37,10 +37,14 @@ struct llc_stats {
 
   // Cache line lifetime statistics (cycles until eviction)
   std::vector<uint64_t> total_lifetime_cycles = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Sum of all lifetime cycles per CPU
-  std::vector<uint64_t> eviction_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);          // Number of evictions per CPU
+  std::vector<uint64_t> eviction_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);          // Number of evictions per CPU (被驱逐的次数)
   // Last heartbeat values for computing per-period lifetime stats
   std::vector<uint64_t> last_heartbeat_total_lifetime_cycles = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> last_heartbeat_eviction_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
+  // Total evictions caused by each CPU (includes both self and other cores' cache lines)
+  std::vector<uint64_t> total_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // 每个核心引起的所有驱逐次数
+  std::vector<uint64_t> last_heartbeat_total_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
 
   // Way occupancy statistics - tracks how many ways each CPU occupies
   // These are snapshots that can be updated periodically
@@ -49,6 +53,18 @@ struct llc_stats {
   // Last heartbeat values for computing per-period way occupancy
   std::vector<uint64_t> last_heartbeat_way_occupancy_samples = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   uint64_t last_heartbeat_way_occupancy_sample_count = 0;
+
+  // Interim lifetime statistics - computed at each heartbeat by traversing all cache lines
+  // This measures how long current cache lines have been residing without being evicted
+  // Unlike eviction-based lifetime, this captures cache lines that are still in cache
+  std::vector<uint64_t> heartbeat_interim_lifetime_sum = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Sum of interim lifetimes at last heartbeat
+  std::vector<uint64_t> heartbeat_interim_line_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);    // Number of cache lines at last heartbeat
+
+  // Fill count statistics for Little's Law calculation
+  // Little's Law: W = L / λ, where W = avg lifetime, L = avg occupancy, λ = arrival rate
+  // λ = fill_count / period_cycles, so W = L × period_cycles / fill_count
+  std::vector<uint64_t> fill_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Total cache line fills per CPU
+  std::vector<uint64_t> last_heartbeat_fill_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
 };
 
 // Global LLC stats instance (defined in cache.cc)

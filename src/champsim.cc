@@ -23,6 +23,7 @@
 #include <fmt/chrono.h>
 #include <fmt/core.h>
 
+#include "cache.h"
 #include "cache_stats.h"
 #include "environment.h"
 #include "ooo_cpu.h"
@@ -108,6 +109,28 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
       // Print heartbeat header
       fmt::print("\n=== Cycle-based Heartbeat {} at global cycle {} (phase cycle {}) ===\n",
                  heartbeat_count, current_cycle, phase_cycle);
+      
+      // Compute interim lifetime statistics by traversing LLC cache lines
+      // This captures cache lines that are still in cache (not just evicted ones)
+      for (CACHE& cache : env.cache_view()) {
+        if (cache.NAME == "LLC") {
+          // Reset interim lifetime stats for this heartbeat
+          std::fill(g_llc_stats.heartbeat_interim_lifetime_sum.begin(), 
+                    g_llc_stats.heartbeat_interim_lifetime_sum.end(), 0);
+          std::fill(g_llc_stats.heartbeat_interim_line_count.begin(), 
+                    g_llc_stats.heartbeat_interim_line_count.end(), 0);
+          
+          // Traverse all cache lines and compute interim lifetime
+          for (const auto& blk : cache.block) {
+            if (blk.valid && blk.cpu < MAX_CPUS_FOR_COMPETITION) {
+              uint64_t interim_lifetime = current_cycle - blk.fill_cycle;
+              g_llc_stats.heartbeat_interim_lifetime_sum[blk.cpu] += interim_lifetime;
+              ++g_llc_stats.heartbeat_interim_line_count[blk.cpu];
+            }
+          }
+          break;  // Only one LLC
+        }
+      }
       
       // Print heartbeat for all CPUs simultaneously
       for (O3_CPU& cpu : env.cpu_view()) {

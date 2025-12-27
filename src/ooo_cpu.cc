@@ -115,6 +115,14 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
     g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu] = g_llc_stats.total_lifetime_cycles[cpu];
     g_llc_stats.last_heartbeat_eviction_count[cpu] = g_llc_stats.eviction_count[cpu];
     
+    // Print total evictions caused by this CPU (includes both self and other cores' cache lines)
+    uint64_t period_total_evictions_caused = g_llc_stats.total_evictions_caused[cpu] - g_llc_stats.last_heartbeat_total_evictions_caused[cpu];
+    fmt::print("  LLC Total Evictions Caused CPU {}: period: {} (total: {})\n",
+               cpu, period_total_evictions_caused, g_llc_stats.total_evictions_caused[cpu]);
+    
+    // Update last heartbeat total evictions caused values for this CPU
+    g_llc_stats.last_heartbeat_total_evictions_caused[cpu] = g_llc_stats.total_evictions_caused[cpu];
+    
     // Print way occupancy statistics
     uint64_t period_way_samples = g_llc_stats.way_occupancy_samples[cpu] - g_llc_stats.last_heartbeat_way_occupancy_samples[cpu];
     uint64_t period_sample_count = g_llc_stats.way_occupancy_sample_count - g_llc_stats.last_heartbeat_way_occupancy_sample_count;
@@ -124,6 +132,22 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
     
     fmt::print("  LLC Way Occupancy CPU {}: period avg: {:.2f} lines, total avg: {:.2f} lines\n",
                cpu, period_avg_ways, total_avg_ways);
+    
+    // Calculate lifetime using Little's Law: W = L × T / λ
+    // Where: W = average lifetime, L = average occupancy, T = period cycles, λ = fill count
+    // This avoids tracking individual cache line fill times
+    uint64_t period_fill_count = g_llc_stats.fill_count[cpu] - g_llc_stats.last_heartbeat_fill_count[cpu];
+    double little_law_lifetime = 0.0;
+    if (period_fill_count > 0) {
+      // W = L × T / λ = period_avg_ways × heartbeat_cycle / period_fill_count
+      little_law_lifetime = period_avg_ways * heartbeat_cycle / period_fill_count;
+    }
+    
+    fmt::print("  LLC Little's Law Lifetime CPU {}: estimated avg: {:.2f} cycles (L={:.2f}, fills={})\n",
+               cpu, little_law_lifetime, period_avg_ways, period_fill_count);
+    
+    // Update last heartbeat fill count for this CPU
+    g_llc_stats.last_heartbeat_fill_count[cpu] = g_llc_stats.fill_count[cpu];
     
     // Update last heartbeat way occupancy values for this CPU
     g_llc_stats.last_heartbeat_way_occupancy_samples[cpu] = g_llc_stats.way_occupancy_samples[cpu];
@@ -143,7 +167,8 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
                    << "period_accesses,period_misses,period_miss_rate,"
                    << "period_evictions_caused,period_evicted_by_others,"
                    << "period_avg_lifetime_cycles,period_eviction_count,"
-                   << "period_avg_way_occupancy\n";
+                   << "period_avg_way_occupancy,period_total_evictions_caused,"
+                   << "little_law_lifetime,period_fill_count\n";
           g_llc_stats_csv_header_written = true;
         }
       } else {
@@ -165,7 +190,10 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
                  << period_evicted_by_others << ","
                  << period_avg_lifetime << ","
                  << period_eviction_count << ","
-                 << period_avg_ways << "\n";
+                 << period_avg_ways << ","
+                 << period_total_evictions_caused << ","
+                 << little_law_lifetime << ","
+                 << period_fill_count << "\n";
         csv_file.close();
       }
     }
