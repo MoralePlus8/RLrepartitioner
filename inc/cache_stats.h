@@ -65,6 +65,19 @@ struct llc_stats {
   // λ = fill_count / period_cycles, so W = L × period_cycles / fill_count
   std::vector<uint64_t> fill_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Total cache line fills per CPU
   std::vector<uint64_t> last_heartbeat_fill_count = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+
+  // IPC statistics for RL partitioner (updated at each heartbeat)
+  // These values store the IPC computed at the last heartbeat
+  std::vector<double> heartbeat_ipc = std::vector<double>(MAX_CPUS_FOR_COMPETITION, 0.0);  // IPC during last heartbeat period
+  std::vector<double> cumulative_ipc = std::vector<double>(MAX_CPUS_FOR_COMPETITION, 0.0);  // Cumulative IPC from phase start
+  std::vector<uint64_t> heartbeat_instrs = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Instructions during last heartbeat
+  std::vector<uint64_t> heartbeat_cycles = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Cycles during last heartbeat
+
+  // RL partitioner real-time IPC tracking (updated every cycle for accurate per-RL-period IPC)
+  // These fields enable RL partitioner to compute IPC at its own update frequency (e.g., every 10K cycles)
+  // instead of relying on heartbeat_ipc which updates much less frequently (e.g., every 5M cycles)
+  std::vector<uint64_t> retired_instructions = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Cumulative retired instructions per CPU
+  uint64_t global_cycle = 0;  // Current global cycle count
 };
 
 // Global LLC stats instance (defined in cache.cc)

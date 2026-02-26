@@ -104,6 +104,15 @@ phase_stats do_phase(const phase_info& phase, environment& env, std::vector<trac
     uint64_t current_cycle = global_clock.now().time_since_epoch() / time_quantum;
     uint64_t phase_cycle = current_cycle - phase_start_cycle;
     
+    // Update real-time stats for RL partitioner (every cycle)
+    // This enables RL partitioner to compute accurate IPC at its own update frequency
+    g_llc_stats.global_cycle = current_cycle;
+    for (O3_CPU& cpu : env.cpu_view()) {
+      if (cpu.cpu < MAX_CPUS_FOR_COMPETITION) {
+        g_llc_stats.retired_instructions[cpu.cpu] = cpu.num_retired;
+      }
+    }
+    
     // Cycle-based heartbeat: trigger when we've passed the next heartbeat threshold
     if (phase_cycle >= last_heartbeat_cycle + HEARTBEAT_CYCLE_PERIOD) {
       // Print heartbeat header

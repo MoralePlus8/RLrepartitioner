@@ -199,6 +199,14 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
     }
   }
 
+  // Update IPC statistics to g_llc_stats for RL partitioner
+  if (cpu < MAX_CPUS_FOR_COMPETITION) {
+    g_llc_stats.heartbeat_ipc[cpu] = heartbeat_ipc;
+    g_llc_stats.cumulative_ipc[cpu] = phase_ipc;
+    g_llc_stats.heartbeat_instrs[cpu] = static_cast<uint64_t>(heartbeat_instr);
+    g_llc_stats.heartbeat_cycles[cpu] = static_cast<uint64_t>(heartbeat_cycle);
+  }
+
   // Update last heartbeat values
   last_heartbeat_instr = num_retired;
   last_heartbeat_time = current_time;
