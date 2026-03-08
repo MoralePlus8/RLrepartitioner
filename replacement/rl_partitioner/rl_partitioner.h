@@ -18,6 +18,7 @@
 #include "cache.h"
 #include "modules.h"
 #include "champsim.h"
+#include "shared_weight_table.h"
 
 /**
  * @class rl_partitioner
@@ -62,7 +63,7 @@ public:
     static constexpr size_t TOTAL_WEIGHTS = MEMORY_SIZE * NUM_ACTIONS;  // 总权重数
     
     // ===== 更新周期参数 =====
-    static constexpr uint64_t UPDATE_INTERVAL = 50000;  // 每隔多少 cycle 进行一次 RL 更新
+    static constexpr uint64_t UPDATE_INTERVAL = 500000;  // 每隔多少 cycle 进行一次 RL 更新
     
     // ===== Experience Replay 参数 =====
     static constexpr size_t REPLAY_BUFFER_SIZE = 1024;  // 环形回放缓冲区容量
@@ -138,6 +139,10 @@ private:
     // ===== Experience Replay 缓冲区 =====
     std::vector<Experience> replay_buffer;
     size_t replay_write_pos = 0;
+    
+    // ===== 共享内存权重表（多进程并行训练）=====
+    SharedWeightTable shared_wt_;
+    std::vector<std::pair<size_t, double>> pending_deltas_;
 
 public:
     // ===== 构造函数 =====

@@ -58,11 +58,29 @@ void rl_partitioner::initialize_replacement()
     partition_p = NUM_WAY / 2;
     last_P = partition_p;
     
-    // 检测环境变量，尝试加载预训练权重
-    const char* load_path_env = std::getenv("RL_WEIGHTS_LOAD");
     bool weights_loaded = false;
-    if (load_path_env != nullptr && std::strlen(load_path_env) > 0) {
-        weights_loaded = load_weights(std::string(load_path_env));
+    
+    // 优先尝试连接共享内存权重表（多进程并行训练模式）
+    const char* shm_path = std::getenv("RL_SHARED_WEIGHTS");
+    if (shm_path != nullptr && std::strlen(shm_path) > 0) {
+        if (shared_wt_.open(std::string(shm_path), TOTAL_WEIGHTS,
+                            NUM_TILINGS, GRID_SIZE_A, GRID_SIZE_M,
+                            static_cast<uint32_t>(MEMORY_SIZE), NUM_ACTIONS,
+                            static_cast<int32_t>(NUM_WAY))) {
+            shared_wt_.read_lock();
+            shared_wt_.snapshot(weights);
+            shared_wt_.read_unlock();
+            weights_loaded = true;
+            std::cout << "[RL_Partitioner] 已连接共享权重表: " << shm_path << std::endl;
+        }
+    }
+    
+    // 回退：从文件加载预训练权重
+    if (!weights_loaded) {
+        const char* load_path_env = std::getenv("RL_WEIGHTS_LOAD");
+        if (load_path_env != nullptr && std::strlen(load_path_env) > 0) {
+            weights_loaded = load_weights(std::string(load_path_env));
+        }
     }
     
     // 检测在线模式：加载了预训练权重 且 设置了 RL_ONLINE_MODE=1
@@ -171,6 +189,15 @@ void rl_partitioner::replacement_final_stats()
     std::cout << "  - 实际参数: LR=" << active_lr << ", EPSILON=" << active_epsilon << std::endl;
     std::cout << "  - Experience Replay 缓冲区使用量: " << replay_buffer.size() 
               << " / " << REPLAY_BUFFER_SIZE << std::endl;
+    std::cout << "  - 共享权重表: " << (shared_wt_.is_open() ? "已连接" : "未使用") << std::endl;
+    
+    // 如果使用共享权重，先获取最新快照
+    if (shared_wt_.is_open()) {
+        shared_wt_.read_lock();
+        shared_wt_.snapshot(weights);
+        shared_wt_.read_unlock();
+        std::cout << "[RL_Partitioner] 已从共享内存同步最新权重" << std::endl;
+    }
     
     // 检查环境变量，保存权重
     const char* save_path_env = std::getenv("RL_WEIGHTS_SAVE");
@@ -419,11 +446,14 @@ void rl_partitioner::update_weights(const std::vector<size_t>& tiles, Action act
 {
     size_t action_offset = static_cast<size_t>(action) * MEMORY_SIZE;
     
-    // 梯度下降：w = w + α * td_error / |tiles|
     double step = active_lr * td_error / static_cast<double>(tiles.size());
     
     for (size_t tile : tiles) {
-        weights[action_offset + tile] += step;
+        size_t idx = action_offset + tile;
+        weights[idx] += step;
+        if (shared_wt_.is_open()) {
+            pending_deltas_.emplace_back(idx, step);
+        }
     }
 }
 
@@ -502,9 +532,17 @@ struct WeightsFileHeader {
 
 bool rl_partitioner::save_weights(const std::string& path) const
 {
+    // 多进程环境下，使用文件锁防止并发写入同一文件
+    std::string lock_path = path + ".lock";
+    int lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0666);
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_EX);
+    }
+    
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs.is_open()) {
         std::cerr << "[RL_Partitioner] 无法打开文件进行写入: " << path << std::endl;
+        if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); ::close(lock_fd); }
         return false;
     }
     
@@ -524,11 +562,17 @@ bool rl_partitioner::save_weights(const std::string& path) const
     
     if (!ofs.good()) {
         std::cerr << "[RL_Partitioner] 权重文件写入失败: " << path << std::endl;
+        if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); ::close(lock_fd); }
         return false;
     }
     
     std::cout << "[RL_Partitioner] 权重已保存到: " << path
               << " (" << sizeof(header) + TOTAL_WEIGHTS * sizeof(double) << " bytes)" << std::endl;
+    
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+    }
     return true;
 }
 
@@ -665,6 +709,14 @@ void rl_partitioner::maybe_update_rl()
     // 更新时间戳
     last_update_cycle = current_global_cycle;
     
+    // 从共享内存同步最新权重（获取其他进程的训练成果）
+    if (shared_wt_.is_open()) {
+        shared_wt_.read_lock();
+        shared_wt_.snapshot(weights);
+        shared_wt_.read_unlock();
+        pending_deltas_.clear();
+    }
+    
     // 收集当前统计信息
     // Group 1: CPU 0 到 NUM_CPUS/2 - 1
     // Group 2: CPU NUM_CPUS/2 到 NUM_CPUS - 1
@@ -765,6 +817,14 @@ void rl_partitioner::maybe_update_rl()
     
     // 从缓冲区随机采样 mini-batch 进行经验回放
     replay_experiences();
+    
+    // 将本轮权重增量同步回共享内存
+    if (shared_wt_.is_open() && !pending_deltas_.empty()) {
+        shared_wt_.write_lock();
+        shared_wt_.apply_deltas(pending_deltas_);
+        shared_wt_.write_unlock();
+        pending_deltas_.clear();
+    }
     
     // 选择下一个动作
     Action next_action = select_action(norm_a1, norm_m1, norm_a2, norm_m2, partition_p);

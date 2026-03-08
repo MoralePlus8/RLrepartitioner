@@ -6,3 +6,4 @@ stats/
 /vcpkg_installed/
 /_configuration.mk
 /absolute.options
+/traces/
