@@ -25,16 +25,11 @@ rl_partitioner::rl_partitioner(CACHE* cache, long sets, long ways)
     : replacement(cache), 
       NUM_WAY(ways),
       last_used_cycles(static_cast<std::size_t>(sets * ways), 0),
-      partition_p(ways / 2),  // 初始平均分配
-      weights(TOTAL_WEIGHTS, 0.0),  // 初始化权重为 0
+      num_groups_(0),
+      weights(TOTAL_WEIGHTS, 0.0),
       active_lr(LEARNING_RATE),
       active_epsilon(EPSILON),
       online_mode(false),
-      last_A1(0), last_A2(0), last_M1(0), last_M2(0),
-      last_P(ways / 2),
-      last_action(ACTION_KEEP),
-      baseline_ipc_g1(0.0),
-      baseline_ipc_g2(0.0),
       last_update_cycle(0),
       rng(std::random_device{}()),
       uniform_dist(0.0, 1.0),
@@ -45,8 +40,7 @@ rl_partitioner::rl_partitioner(CACHE* cache, long sets, long ways)
       baseline_initialized(false)
 {
     replay_buffer.reserve(REPLAY_BUFFER_SIZE);
-    std::cout << "[RL_Partitioner] 初始化: NUM_WAY=" << NUM_WAY 
-              << ", 初始分区 P=" << partition_p << std::endl;
+    std::cout << "[RL_Partitioner] 构造: NUM_WAY=" << NUM_WAY << std::endl;
 }
 
 // ============================================================================
@@ -55,12 +49,31 @@ rl_partitioner::rl_partitioner(CACHE* cache, long sets, long ways)
 
 void rl_partitioner::initialize_replacement()
 {
-    partition_p = NUM_WAY / 2;
-    last_P = partition_p;
+    // 1. 解析核心组配置
+    parse_core_group_config();
     
+    // 2. 初始化分区（各组均匀分配 Way）
+    partition_ways_.resize(num_groups_);
+    long base_ways = NUM_WAY / num_groups_;
+    long remainder = NUM_WAY % num_groups_;
+    for (int g = 0; g < num_groups_; g++) {
+        partition_ways_[g] = base_ways + (g < remainder ? 1 : 0);
+    }
+    
+    // 3. 初始化各核心组的状态向量
+    last_norm_a_.assign(num_groups_, 0.0);
+    last_norm_m_.assign(num_groups_, 0.0);
+    last_norm_a_rest_.assign(num_groups_, 0.0);
+    last_norm_m_rest_.assign(num_groups_, 0.0);
+    last_partition_.resize(num_groups_);
+    for (int g = 0; g < num_groups_; g++) last_partition_[g] = partition_ways_[g];
+    last_actions_.assign(num_groups_, ACTION_KEEP);
+    baseline_ipc_.assign(num_groups_, 0.0);
+    baseline_ipc_rest_.assign(num_groups_, 0.0);
+    
+    // 4. 加载权重
     bool weights_loaded = false;
     
-    // 优先尝试连接共享内存权重表（多进程并行训练模式）
     const char* shm_path = std::getenv("RL_SHARED_WEIGHTS");
     if (shm_path != nullptr && std::strlen(shm_path) > 0) {
         if (shared_wt_.open(std::string(shm_path), TOTAL_WEIGHTS,
@@ -75,7 +88,6 @@ void rl_partitioner::initialize_replacement()
         }
     }
     
-    // 回退：从文件加载预训练权重
     if (!weights_loaded) {
         const char* load_path_env = std::getenv("RL_WEIGHTS_LOAD");
         if (load_path_env != nullptr && std::strlen(load_path_env) > 0) {
@@ -83,7 +95,7 @@ void rl_partitioner::initialize_replacement()
         }
     }
     
-    // 检测在线模式：加载了预训练权重 且 设置了 RL_ONLINE_MODE=1
+    // 5. 在线模式检测
     const char* online_env = std::getenv("RL_ONLINE_MODE");
     if (weights_loaded && online_env != nullptr && std::string(online_env) == "1") {
         online_mode = true;
@@ -99,10 +111,19 @@ void rl_partitioner::initialize_replacement()
         }
     }
     
+    // 6. 输出配置信息
     std::cout << "[RL_Partitioner] 替换策略初始化完成" << std::endl;
     std::cout << "  - 总 Way 数: " << NUM_WAY << std::endl;
-    std::cout << "  - Group 1 Way 数: " << partition_p << std::endl;
-    std::cout << "  - Group 2 Way 数: " << (NUM_WAY - partition_p) << std::endl;
+    std::cout << "  - 核心组数: " << num_groups_ << std::endl;
+    for (int g = 0; g < num_groups_; g++) {
+        std::cout << "  - Group " << g << ": Way 数=" << partition_ways_[g]
+                  << ", CPUs=[";
+        for (size_t i = 0; i < group_cpus_[g].size(); i++) {
+            if (i > 0) std::cout << ",";
+            std::cout << group_cpus_[g][i];
+        }
+        std::cout << "]" << std::endl;
+    }
     std::cout << "  - Tile Coding: NUM_TILINGS=" << NUM_TILINGS 
               << ", GRID_SIZE=" << GRID_SIZE_A << "x" << GRID_SIZE_M << std::endl;
     std::cout << "  - Q-Learning: LR=" << active_lr
@@ -117,39 +138,25 @@ long rl_partitioner::find_victim(uint32_t triggering_cpu, uint64_t instr_id, lon
                                   const champsim::cache_block* current_set, champsim::address ip,
                                   champsim::address full_addr, access_type type)
 {
-    // 周期性检查是否需要 RL 更新
     maybe_update_rl();
     
-    // 确定 CPU 所属的组
     uint32_t group_id = get_group_id(triggering_cpu);
     
-    // 根据分区确定搜索范围
-    long partition_start, partition_end;
-    if (group_id == 0) {
-        // Group 1: Way [0, partition_p)
-        partition_start = 0;
-        partition_end = partition_p;
-    } else {
-        // Group 2: Way [partition_p, NUM_WAY)
-        partition_start = partition_p;
-        partition_end = NUM_WAY;
-    }
+    // 根据核心组计算 Way 范围
+    long partition_start = get_way_start(group_id);
+    long partition_end = partition_start + partition_ways_[group_id];
     
-    // 确保分区范围有效
     if (partition_start >= partition_end) {
-        // 如果分区为空，使用整个 cache
         partition_start = 0;
         partition_end = NUM_WAY;
     }
     
-    // 首先在分区内查找无效 way
     for (long w = partition_start; w < partition_end; w++) {
         if (!current_set[w].valid) {
             return w;
         }
     }
     
-    // 使用 LRU 策略在分区内选择 victim
     auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_start);
     auto end = std::next(std::begin(last_used_cycles), set * NUM_WAY + partition_end);
     
@@ -182,16 +189,17 @@ void rl_partitioner::replacement_final_stats()
 {
     std::cout << "\n[RL_Partitioner] 最终统计信息:" << std::endl;
     std::cout << "  - 模式: " << (online_mode ? "在线微调" : "离线训练") << std::endl;
-    std::cout << "  - 最终分区 P (Group 1 Way 数): " << partition_p << std::endl;
-    std::cout << "  - Group 2 Way 数: " << (NUM_WAY - partition_p) << std::endl;
-    std::cout << "  - 最终 IPC 基线 Group 1: " << std::fixed << std::setprecision(4) << baseline_ipc_g1 << std::endl;
-    std::cout << "  - 最终 IPC 基线 Group 2: " << std::fixed << std::setprecision(4) << baseline_ipc_g2 << std::endl;
+    std::cout << "  - 核心组数: " << num_groups_ << std::endl;
+    for (int g = 0; g < num_groups_; g++) {
+        std::cout << "  - Group " << g << ": Way 数=" << partition_ways_[g]
+                  << ", IPC 基线=" << std::fixed << std::setprecision(4) << baseline_ipc_[g]
+                  << std::endl;
+    }
     std::cout << "  - 实际参数: LR=" << active_lr << ", EPSILON=" << active_epsilon << std::endl;
     std::cout << "  - Experience Replay 缓冲区使用量: " << replay_buffer.size() 
               << " / " << REPLAY_BUFFER_SIZE << std::endl;
     std::cout << "  - 共享权重表: " << (shared_wt_.is_open() ? "已连接" : "未使用") << std::endl;
     
-    // 如果使用共享权重，先获取最新快照
     if (shared_wt_.is_open()) {
         shared_wt_.read_lock();
         shared_wt_.snapshot(weights);
@@ -199,7 +207,6 @@ void rl_partitioner::replacement_final_stats()
         std::cout << "[RL_Partitioner] 已从共享内存同步最新权重" << std::endl;
     }
     
-    // 检查环境变量，保存权重
     const char* save_path_env = std::getenv("RL_WEIGHTS_SAVE");
     if (save_path_env != nullptr && std::strlen(save_path_env) > 0) {
         save_weights(std::string(save_path_env));
@@ -640,27 +647,33 @@ bool rl_partitioner::load_weights(const std::string& path)
 // 辅助函数实现
 // ============================================================================
 
-void rl_partitioner::apply_action(Action action)
+void rl_partitioner::apply_actions(const std::vector<Action>& actions)
 {
-    long old_p = partition_p;
+    bool changed = false;
+    long max_per_group = NUM_WAY - (num_groups_ - 1);
     
-    switch (action) {
-        case ACTION_INC:
-            partition_p = std::min(partition_p + 1, NUM_WAY - 1);
-            break;
-        case ACTION_DEC:
-            partition_p = std::max(partition_p - 1, 1L);
-            break;
-        case ACTION_KEEP:
-        default:
-            // 不改变
-            break;
+    for (int g = 0; g < num_groups_; g++) {
+        long old_p = partition_ways_[g];
+        switch (actions[g]) {
+            case ACTION_INC:
+                partition_ways_[g] = std::min(partition_ways_[g] + 1, max_per_group);
+                break;
+            case ACTION_DEC:
+                partition_ways_[g] = std::max(partition_ways_[g] - 1, 1L);
+                break;
+            case ACTION_KEEP:
+            default:
+                break;
+        }
+        if (old_p != partition_ways_[g]) changed = true;
     }
     
-    if (old_p != partition_p) {
-        std::cout << "[RL_Partitioner] 分区调整: P " << old_p << " -> " << partition_p 
-                  << " (动作: " << (action == ACTION_INC ? "INC" : (action == ACTION_DEC ? "DEC" : "KEEP")) << ")" 
-                  << std::endl;
+    if (changed) {
+        std::cout << "[RL_Partitioner] 分区调整:";
+        for (int g = 0; g < num_groups_; g++) {
+            std::cout << " G" << g << "=" << partition_ways_[g];
+        }
+        std::cout << std::endl;
     }
 }
 
@@ -677,39 +690,219 @@ uint64_t rl_partitioner::hash_mix(uint64_t x)
 
 uint32_t rl_partitioner::get_group_id(uint32_t cpu) const
 {
-    // 将 CPU 分为两组：
-    // Group 0: CPU 0, 2, 4, ...
-    // Group 1: CPU 1, 3, 5, ...
-    // 或者简单地根据 CPU 数量平分：
-    // 如果有 N 个 CPU，前 N/2 个属于 Group 0，后 N/2 个属于 Group 1
-    
-    // 这里采用简单的平分策略
-    if (NUM_CPUS <= 1) {
-        return 0;
+    if (cpu < cpu_to_group_.size()) {
+        return cpu_to_group_[cpu];
     }
-    return (cpu < NUM_CPUS / 2) ? 0 : 1;
+    return 0;
+}
+
+void rl_partitioner::parse_core_group_config()
+{
+    cpu_to_group_.resize(NUM_CPUS, 0);
+    
+    const char* groups_env = std::getenv("RL_CORE_GROUPS");
+    if (groups_env != nullptr && std::strlen(groups_env) > 0) {
+        // 显式指定各 CPU 的核心组 ID，逗号分隔，例如 "0,0,1,1,2,2"
+        std::string cfg(groups_env);
+        size_t cpu_idx = 0;
+        size_t pos = 0;
+        int max_group = 0;
+        
+        while (pos < cfg.size() && cpu_idx < NUM_CPUS) {
+            size_t next = cfg.find(',', pos);
+            if (next == std::string::npos) next = cfg.size();
+            int gid = std::stoi(cfg.substr(pos, next - pos));
+            cpu_to_group_[cpu_idx] = static_cast<uint32_t>(gid);
+            max_group = std::max(max_group, gid);
+            cpu_idx++;
+            pos = next + 1;
+        }
+        
+        num_groups_ = max_group + 1;
+        
+        for (; cpu_idx < NUM_CPUS; cpu_idx++) {
+            cpu_to_group_[cpu_idx] = static_cast<uint32_t>(num_groups_ - 1);
+        }
+    } else {
+        // 通过 RL_NUM_GROUPS 指定组数，自动均匀分配；默认 2 组
+        const char* num_groups_env = std::getenv("RL_NUM_GROUPS");
+        if (num_groups_env != nullptr && std::strlen(num_groups_env) > 0) {
+            num_groups_ = std::max(1, std::stoi(std::string(num_groups_env)));
+        } else {
+            num_groups_ = std::min(2, static_cast<int>(NUM_CPUS));
+        }
+        
+        for (size_t i = 0; i < NUM_CPUS; i++) {
+            cpu_to_group_[i] = static_cast<uint32_t>(
+                static_cast<size_t>(i) * static_cast<size_t>(num_groups_) / NUM_CPUS);
+        }
+    }
+    
+    // 构建 group_cpus_ 反向映射
+    group_cpus_.resize(num_groups_);
+    for (size_t i = 0; i < NUM_CPUS; i++) {
+        group_cpus_[cpu_to_group_[i]].push_back(static_cast<uint32_t>(i));
+    }
+    
+    for (int g = 0; g < num_groups_; g++) {
+        if (group_cpus_[g].empty()) {
+            std::cerr << "[RL_Partitioner] 警告: Group " << g << " 没有分配任何 CPU" << std::endl;
+        }
+    }
+    
+    if (num_groups_ > NUM_WAY) {
+        std::cerr << "[RL_Partitioner] 警告: 核心组数 (" << num_groups_
+                  << ") 大于 Way 数 (" << NUM_WAY
+                  << ")，将截断核心组数" << std::endl;
+        num_groups_ = static_cast<int>(NUM_WAY);
+        group_cpus_.clear();
+        group_cpus_.resize(num_groups_);
+        for (size_t i = 0; i < NUM_CPUS; i++) {
+            if (cpu_to_group_[i] >= static_cast<uint32_t>(num_groups_)) {
+                cpu_to_group_[i] = static_cast<uint32_t>(num_groups_ - 1);
+            }
+            group_cpus_[cpu_to_group_[i]].push_back(static_cast<uint32_t>(i));
+        }
+    }
+}
+
+long rl_partitioner::get_way_start(uint32_t group_id) const
+{
+    long start = 0;
+    for (uint32_t g = 0; g < group_id && g < static_cast<uint32_t>(num_groups_); g++) {
+        start += partition_ways_[g];
+    }
+    return start;
+}
+
+std::vector<rl_partitioner::Action> rl_partitioner::select_best_actions_constrained(
+    const std::vector<std::array<double, NUM_ACTIONS>>& q_values) const
+{
+    int n = num_groups_;
+    int offset = n;
+    int range = 2 * n + 1;
+    long max_per_group = NUM_WAY - (num_groups_ - 1);
+    
+    // dp[i][s+offset] = 考虑前 i 个核心组、delta 总和为 s 时的最大总 Q 值
+    std::vector<std::vector<double>> dp(n + 1, std::vector<double>(range, -1e18));
+    std::vector<std::vector<int>> choice(n + 1, std::vector<int>(range, -1));
+    
+    dp[0][offset] = 0.0;
+    
+    for (int i = 0; i < n; i++) {
+        for (int s = -n; s <= n; s++) {
+            if (dp[i][s + offset] <= -1e17) continue;
+            
+            for (int a = 0; a < NUM_ACTIONS; a++) {
+                int delta = (a == ACTION_INC) ? 1 : ((a == ACTION_DEC) ? -1 : 0);
+                
+                long new_p = partition_ways_[i] + delta;
+                if (new_p < 1 || new_p > max_per_group) continue;
+                
+                int new_s = s + delta;
+                if (new_s < -n || new_s > n) continue;
+                
+                double new_q = dp[i][s + offset] + q_values[i][a];
+                if (new_q > dp[i + 1][new_s + offset]) {
+                    dp[i + 1][new_s + offset] = new_q;
+                    choice[i + 1][new_s + offset] = a;
+                }
+            }
+        }
+    }
+    
+    std::vector<Action> actions(n, ACTION_KEEP);
+    
+    if (dp[n][offset] <= -1e17) {
+        return actions;
+    }
+    
+    // 回溯恢复各组动作
+    int current_sum = 0;
+    for (int i = n; i >= 1; i--) {
+        int a = choice[i][current_sum + offset];
+        actions[i - 1] = static_cast<Action>(a);
+        int delta = (a == ACTION_INC) ? 1 : ((a == ACTION_DEC) ? -1 : 0);
+        current_sum -= delta;
+    }
+    
+    return actions;
+}
+
+std::vector<rl_partitioner::Action> rl_partitioner::select_random_actions_constrained()
+{
+    std::vector<Action> actions(num_groups_, ACTION_KEEP);
+    long max_per_group = NUM_WAY - (num_groups_ - 1);
+    
+    // 构建可 INC / 可 DEC 的候选组列表
+    std::vector<int> inc_candidates, dec_candidates;
+    for (int g = 0; g < num_groups_; g++) {
+        if (partition_ways_[g] + 1 <= max_per_group) inc_candidates.push_back(g);
+        if (partition_ways_[g] - 1 >= 1) dec_candidates.push_back(g);
+    }
+    
+    int max_k = std::min({num_groups_ / 2,
+                          static_cast<int>(inc_candidates.size()),
+                          static_cast<int>(dec_candidates.size())});
+    
+    if (max_k == 0) return actions;
+    
+    std::uniform_int_distribution<int> k_dist(0, max_k);
+    int k = k_dist(rng);
+    if (k == 0) return actions;
+    
+    // 随机选 k 个组执行 INC
+    std::shuffle(inc_candidates.begin(), inc_candidates.end(), rng);
+    
+    std::vector<bool> used(num_groups_, false);
+    int inc_count = 0;
+    for (int g : inc_candidates) {
+        if (inc_count >= k) break;
+        actions[g] = ACTION_INC;
+        used[g] = true;
+        inc_count++;
+    }
+    
+    // 从未被选中 INC 的组中，随机选 k 个执行 DEC
+    std::vector<int> remaining_dec;
+    for (int g : dec_candidates) {
+        if (!used[g]) remaining_dec.push_back(g);
+    }
+    std::shuffle(remaining_dec.begin(), remaining_dec.end(), rng);
+    
+    int dec_count = 0;
+    for (int g : remaining_dec) {
+        if (dec_count >= k) break;
+        actions[g] = ACTION_DEC;
+        dec_count++;
+    }
+    
+    if (dec_count < k) {
+        return std::vector<Action>(num_groups_, ACTION_KEEP);
+    }
+    
+    return actions;
 }
 
 void rl_partitioner::maybe_update_rl()
 {
-    // 获取当前全局 cycle（从 g_llc_stats 获取，由 champsim.cc 每周期更新）
+    // 单组无需分区
+    if (num_groups_ <= 1) return;
+    
     uint64_t current_global_cycle = g_llc_stats.global_cycle;
     
-    // 检查是否达到更新间隔
     if (current_global_cycle - last_update_cycle < UPDATE_INTERVAL) {
         return;
     }
     
-    // 计算周期增量（用于 IPC 计算）
     uint64_t delta_cycles = current_global_cycle - last_rl_global_cycle;
     if (delta_cycles == 0) {
-        return;  // 避免除零
+        return;
     }
     
-    // 更新时间戳
     last_update_cycle = current_global_cycle;
     
-    // 从共享内存同步最新权重（获取其他进程的训练成果）
+    // 从共享内存同步最新权重
     if (shared_wt_.is_open()) {
         shared_wt_.read_lock();
         shared_wt_.snapshot(weights);
@@ -717,105 +910,103 @@ void rl_partitioner::maybe_update_rl()
         pending_deltas_.clear();
     }
     
-    // 收集当前统计信息
-    // Group 1: CPU 0 到 NUM_CPUS/2 - 1
-    // Group 2: CPU NUM_CPUS/2 到 NUM_CPUS - 1
+    // ===== 1. 按核心组收集统计信息 =====
+    std::vector<uint64_t> group_A(num_groups_, 0);
+    std::vector<uint64_t> group_M(num_groups_, 0);
+    std::vector<uint64_t> group_delta_instrs(num_groups_, 0);
     
-    uint64_t A1 = 0, A2 = 0;  // LLC Access
-    uint64_t M1 = 0, M2 = 0;  // LLC Miss
-    uint64_t delta_instrs1 = 0, delta_instrs2 = 0;  // 指令增量
-    
-    size_t half_cpus = (NUM_CPUS + 1) / 2;
-    
-    // 累加 Group 1 的统计
-    for (size_t i = 0; i < half_cpus && i < NUM_CPUS; i++) {
-        // 计算 LLC 访问和缺失增量
-        uint64_t delta_access = g_llc_stats.accesses[i] - last_accesses[i];
-        uint64_t delta_miss = g_llc_stats.misses[i] - last_misses[i];
+    for (size_t i = 0; i < NUM_CPUS; i++) {
+        uint32_t g = cpu_to_group_[i];
+        group_A[g] += g_llc_stats.accesses[i] - last_accesses[i];
+        group_M[g] += g_llc_stats.misses[i] - last_misses[i];
+        group_delta_instrs[g] += g_llc_stats.retired_instructions[i] - last_retired_instructions[i];
         
-        A1 += delta_access;
-        M1 += delta_miss;
-        
-        // 计算指令增量（用于实时 IPC 计算）
-        delta_instrs1 += g_llc_stats.retired_instructions[i] - last_retired_instructions[i];
-        
-        // 更新历史值
         last_accesses[i] = g_llc_stats.accesses[i];
         last_misses[i] = g_llc_stats.misses[i];
         last_retired_instructions[i] = g_llc_stats.retired_instructions[i];
     }
     
-    // 累加 Group 2 的统计
-    for (size_t i = half_cpus; i < NUM_CPUS; i++) {
-        // 计算 LLC 访问和缺失增量
-        uint64_t delta_access = g_llc_stats.accesses[i] - last_accesses[i];
-        uint64_t delta_miss = g_llc_stats.misses[i] - last_misses[i];
-        
-        A2 += delta_access;
-        M2 += delta_miss;
-        
-        // 计算指令增量（用于实时 IPC 计算）
-        delta_instrs2 += g_llc_stats.retired_instructions[i] - last_retired_instructions[i];
-        
-        // 更新历史值
-        last_accesses[i] = g_llc_stats.accesses[i];
-        last_misses[i] = g_llc_stats.misses[i];
-        last_retired_instructions[i] = g_llc_stats.retired_instructions[i];
-    }
-    
-    // 更新上次 RL 全局 cycle
     last_rl_global_cycle = current_global_cycle;
     
-    // 计算实时 IPC（基于当前 RL 周期内的增量，而非 heartbeat_ipc）
-    // 这确保了每次 RL 更新都使用该周期内的真实性能数据
-    double ipc1 = static_cast<double>(delta_instrs1) / static_cast<double>(delta_cycles);
-    double ipc2 = static_cast<double>(delta_instrs2) / static_cast<double>(delta_cycles);
+    // ===== 2. 计算各组和全局总量 =====
+    uint64_t total_A = 0, total_M = 0, total_delta_instrs = 0;
+    for (int g = 0; g < num_groups_; g++) {
+        total_A += group_A[g];
+        total_M += group_M[g];
+        total_delta_instrs += group_delta_instrs[g];
+    }
     
-    // 归一化状态特征
-    double norm_a1 = log_normalize(A1);
-    double norm_m1 = log_normalize(M1);
-    double norm_a2 = log_normalize(A2);
-    double norm_m2 = log_normalize(M2);
+    // ===== 3. 构造 "one-vs-rest" 状态特征 =====
+    std::vector<double> norm_a(num_groups_), norm_m(num_groups_);
+    std::vector<double> norm_a_rest(num_groups_), norm_m_rest(num_groups_);
+    std::vector<double> group_ipc(num_groups_), ipc_rest(num_groups_);
     
-    // 初始化基线
+    for (int g = 0; g < num_groups_; g++) {
+        norm_a[g] = log_normalize(group_A[g]);
+        norm_m[g] = log_normalize(group_M[g]);
+        norm_a_rest[g] = log_normalize(total_A - group_A[g]);
+        norm_m_rest[g] = log_normalize(total_M - group_M[g]);
+        group_ipc[g] = static_cast<double>(group_delta_instrs[g]) / static_cast<double>(delta_cycles);
+        ipc_rest[g] = static_cast<double>(total_delta_instrs - group_delta_instrs[g]) / static_cast<double>(delta_cycles);
+    }
+    
+    // ===== 4. 初始化基线 =====
     if (!baseline_initialized) {
-        if (ipc1 > 0 && ipc2 > 0) {
-            baseline_ipc_g1 = ipc1;
-            baseline_ipc_g2 = ipc2;
+        bool all_positive = true;
+        for (int g = 0; g < num_groups_; g++) {
+            if (group_ipc[g] <= 0) { all_positive = false; break; }
+        }
+        if (all_positive) {
+            for (int g = 0; g < num_groups_; g++) {
+                baseline_ipc_[g] = group_ipc[g];
+                baseline_ipc_rest_[g] = ipc_rest[g];
+                last_norm_a_[g] = norm_a[g];
+                last_norm_m_[g] = norm_m[g];
+                last_norm_a_rest_[g] = norm_a_rest[g];
+                last_norm_m_rest_[g] = norm_m_rest[g];
+                last_partition_[g] = partition_ways_[g];
+                last_actions_[g] = ACTION_KEEP;
+            }
             baseline_initialized = true;
-            
-            // 初始化上一状态
-            last_A1 = norm_a1;
-            last_M1 = norm_m1;
-            last_A2 = norm_a2;
-            last_M2 = norm_m2;
-            last_P = partition_p;
-            last_action = ACTION_KEEP;
-            
-            std::cout << "[RL_Partitioner] 基线初始化: IPC_G1=" << ipc1 << ", IPC_G2=" << ipc2 << std::endl;
+            std::cout << "[RL_Partitioner] 基线初始化:";
+            for (int g = 0; g < num_groups_; g++) {
+                std::cout << " IPC_G" << g << "=" << group_ipc[g];
+            }
+            std::cout << std::endl;
         }
         return;
     }
     
-    // 计算奖励
-    double r1 = compute_reward(ipc1, baseline_ipc_g1);
-    double r2 = compute_reward(ipc2, baseline_ipc_g2);
+    // ===== 5. 计算各组奖励并更新基线 =====
+    std::vector<double> r(num_groups_), r_rest(num_groups_);
+    for (int g = 0; g < num_groups_; g++) {
+        r[g] = compute_reward(group_ipc[g], baseline_ipc_[g]);
+        r_rest[g] = compute_reward(ipc_rest[g], baseline_ipc_rest_[g]);
+        update_baseline(baseline_ipc_[g], group_ipc[g]);
+        update_baseline(baseline_ipc_rest_[g], ipc_rest[g]);
+    }
     
-    // 更新基线
-    update_baseline(baseline_ipc_g1, ipc1);
-    update_baseline(baseline_ipc_g2, ipc2);
+    // ===== 6. 从各组 one-vs-rest 视角训练 =====
+    for (int g = 0; g < num_groups_; g++) {
+        train(last_norm_a_[g], last_norm_m_[g],
+              last_norm_a_rest_[g], last_norm_m_rest_[g],
+              last_partition_[g], last_actions_[g],
+              r[g], r_rest[g],
+              norm_a[g], norm_m[g],
+              norm_a_rest[g], norm_m_rest[g],
+              partition_ways_[g]);
+        
+        // 存储两个视角的经验（单视角统一格式）
+        store_experience({last_norm_a_[g], last_norm_m_[g], last_partition_[g],
+                          last_actions_[g], r[g],
+                          norm_a[g], norm_m[g], partition_ways_[g]});
+        store_experience({last_norm_a_rest_[g], last_norm_m_rest_[g],
+                          NUM_WAY - last_partition_[g],
+                          flip_action(last_actions_[g]), r_rest[g],
+                          norm_a_rest[g], norm_m_rest[g],
+                          NUM_WAY - partition_ways_[g]});
+    }
     
-    // 执行训练（双重更新）
-    train(last_A1, last_M1, last_A2, last_M2, last_P, last_action, r1, r2,
-          norm_a1, norm_m1, norm_a2, norm_m2, partition_p);
-    
-    // 将两个视角的经验存入回放缓冲区（统一为单视角格式）
-    store_experience({last_A1, last_M1, last_P, last_action, r1,
-                      norm_a1, norm_m1, partition_p});
-    store_experience({last_A2, last_M2, NUM_WAY - last_P, flip_action(last_action), r2,
-                      norm_a2, norm_m2, NUM_WAY - partition_p});
-    
-    // 从缓冲区随机采样 mini-batch 进行经验回放
     replay_experiences();
     
     // 将本轮权重增量同步回共享内存
@@ -826,31 +1017,46 @@ void rl_partitioner::maybe_update_rl()
         pending_deltas_.clear();
     }
     
-    // 选择下一个动作
-    Action next_action = select_action(norm_a1, norm_m1, norm_a2, norm_m2, partition_p);
+    // ===== 7. 约束动作选取：最大化总 Q 值，保证 #INC = #DEC =====
+    std::vector<std::array<double, NUM_ACTIONS>> q_values(num_groups_);
+    for (int g = 0; g < num_groups_; g++) {
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            q_values[g][a] = compute_global_q(
+                norm_a[g], norm_m[g], norm_a_rest[g], norm_m_rest[g],
+                partition_ways_[g], static_cast<Action>(a));
+        }
+    }
     
-    // 应用动作
-    apply_action(next_action);
+    std::vector<Action> actions;
+    if (uniform_dist(rng) < active_epsilon) {
+        actions = select_random_actions_constrained();
+    } else {
+        actions = select_best_actions_constrained(q_values);
+    }
     
-    // 保存当前状态
-    last_A1 = norm_a1;
-    last_M1 = norm_m1;
-    last_A2 = norm_a2;
-    last_M2 = norm_m2;
-    last_P = partition_p;
-    last_action = next_action;
+    // ===== 8. 应用动作 =====
+    apply_actions(actions);
     
-    // 输出调试信息（可选）
+    // ===== 9. 保存当前状态 =====
+    for (int g = 0; g < num_groups_; g++) {
+        last_norm_a_[g] = norm_a[g];
+        last_norm_m_[g] = norm_m[g];
+        last_norm_a_rest_[g] = norm_a_rest[g];
+        last_norm_m_rest_[g] = norm_m_rest[g];
+        last_partition_[g] = partition_ways_[g];
+        last_actions_[g] = actions[g];
+    }
+    
+    // ===== 10. 调试输出 =====
     static uint64_t update_count = 0;
-    if (++update_count % 10 == 0) {  // 每 10 次更新输出一次
-        std::cout << "[RL_Partitioner] 更新 #" << update_count 
-                  << " | P=" << partition_p 
-                  << " | A1=" << A1 << " M1=" << M1 
-                  << " | A2=" << A2 << " M2=" << M2
-                  << " | IPC1=" << std::fixed << std::setprecision(3) << ipc1 
-                  << " IPC2=" << ipc2
-                  << " | R1=" << std::setprecision(2) << r1 
-                  << " R2=" << r2
-                  << std::endl;
+    if (++update_count % 10 == 0) {
+        std::cout << "[RL_Partitioner] 更新 #" << update_count << " |";
+        for (int g = 0; g < num_groups_; g++) {
+            std::cout << " G" << g << ":[P=" << partition_ways_[g]
+                      << " A=" << group_A[g] << " M=" << group_M[g]
+                      << " IPC=" << std::fixed << std::setprecision(3) << group_ipc[g]
+                      << " R=" << std::setprecision(2) << r[g] << "]";
+        }
+        std::cout << std::endl;
     }
 }

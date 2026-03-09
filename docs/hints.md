@@ -53,3 +53,72 @@ RL_WEIGHTS_LOAD=./rl_weights.bin RL_ONLINE_MODE=1 \
 ```
 
 如果不指定 `--csv-output`，则默认输出到 `llc_stats.csv`（由 `g_llc_stats_csv_path` 的默认值决定）。
+
+## 通过 **环境变量** 配置核心组，有两种方式
+
+---
+
+### 方式一：`RL_CORE_GROUPS` — 精确指定每个 CPU 的组归属
+
+逗号分隔的组 ID 列表，按 CPU 编号顺序对应。
+
+```bash
+# 6 核心，分 3 组：CPU 0,1 → Group 0, CPU 2,3 → Group 1, CPU 4,5 → Group 2
+RL_CORE_GROUPS=0,0,1,1,2,2 ./champsim --warmup 50000000 --simulation 200000000 trace0 trace1 trace2 trace3 trace4 trace5
+
+# 4 核心，不均匀分组：CPU 0 独占一组，CPU 1,2,3 共享一组
+RL_CORE_GROUPS=0,1,1,1 ./champsim --warmup 50000000 --simulation 200000000 trace0 trace1 trace2 trace3
+
+# 4 核心，3 组（2+1+1）
+RL_CORE_GROUPS=0,0,1,2 ./champsim ...
+```
+
+组数自动从最大组 ID 推断（`max_group_id + 1`）。如果提供的条目数少于 CPU 数，剩余 CPU 自动归入最后一组。
+
+---
+
+### 方式二：`RL_NUM_GROUPS` — 指定组数，自动均匀分配
+
+```bash
+# 6 核心均分 3 组：CPU 0,1 → G0, CPU 2,3 → G1, CPU 4,5 → G2
+RL_NUM_GROUPS=3 ./champsim --warmup 50000000 --simulation 200000000 trace0 trace1 trace2 trace3 trace4 trace5
+
+# 8 核心均分 4 组
+RL_NUM_GROUPS=4 ./champsim ...
+```
+
+分配公式为 `cpu_id * num_groups / num_cpus`，尽量均匀。
+
+---
+
+### 不设置（默认行为）
+
+```bash
+# 默认 2 组，前半 CPU → Group 0，后半 → Group 1（与改动前行为一致）
+./champsim --warmup 50000000 --simulation 200000000 trace0 trace1
+```
+
+---
+
+### 优先级
+
+`RL_CORE_GROUPS` > `RL_NUM_GROUPS` > 默认 2 组。两个变量同时设置时，以 `RL_CORE_GROUPS` 为准。
+
+### 初始化输出验证
+
+启动时日志会打印配置结果，可用于验证：
+
+```
+[RL_Partitioner] 替换策略初始化完成
+  - 总 Way 数: 16
+  - 核心组数: 3
+  - Group 0: Way 数=6, CPUs=[0,1]
+  - Group 1: Way 数=5, CPUs=[2,3]
+  - Group 2: Way 数=5, CPUs=[4,5]
+```
+
+### 注意事项
+
+- 组 ID 必须从 0 开始连续编号（例如不要写 `0,0,2,2` 跳过组 1，否则组 1 将存在但没有 CPU，会触发警告）
+- 核心组数不能超过 LLC Way 数（每组至少需要 1 个 Way）
+- 可以与其他 RL 环境变量组合使用，例如 `RL_CORE_GROUPS=0,0,1,1,2,2 RL_WEIGHTS_SAVE=weights.bin ./champsim ...`

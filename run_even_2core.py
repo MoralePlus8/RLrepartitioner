@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-使用单核 LRU 模拟器逐一运行 traces 目录下的每个 trace，
-将统计结果输出到 stats/alone 目录。
+读取 traces 目录下的所有 trace 文件，两两组合，
+每组使用 bin/champsim_2core_even 模拟运行，
+将统计数据文件输出到 stats/even_2core 目录。
 """
 
 import os
@@ -10,19 +11,21 @@ import glob
 import time
 import subprocess
 import argparse
+import itertools
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-DEFAULT_BIN = PROJECT_ROOT / "bin" / "champsim_1core_lru"
+DEFAULT_BIN = PROJECT_ROOT / "bin" / "champsim_2core_even"
 DEFAULT_TRACES_DIR = PROJECT_ROOT / "traces"
-DEFAULT_STATS_DIR = PROJECT_ROOT / "stats" / "alone"
+DEFAULT_STATS_DIR = PROJECT_ROOT / "stats" / "even_2core"
 DEFAULT_WARMUP = 50_000_000       # 50M
 DEFAULT_SIMULATION = 500_000_000  # 500M
 DEFAULT_WORKERS = 8
 
 
 def get_trace_files(traces_dir: Path) -> list:
+    """获取 traces 目录下所有 trace 文件"""
     patterns = [
         str(traces_dir / "*.champsimtrace.xz"),
         str(traces_dir / "*.trace.xz"),
@@ -34,6 +37,7 @@ def get_trace_files(traces_dir: Path) -> list:
 
 
 def get_trace_name(trace_path: str) -> str:
+    """从 trace 路径提取简短名称（不含扩展名）"""
     basename = os.path.basename(trace_path)
     for suffix in [".champsimtrace.xz", ".trace.xz"]:
         if basename.endswith(suffix):
@@ -42,11 +46,14 @@ def get_trace_name(trace_path: str) -> str:
 
 
 def run_single(args_tuple: tuple) -> dict:
-    trace, output_csv, champsim_bin, warmup, simulation = args_tuple
-    trace_name = get_trace_name(trace)
+    """运行单组两核模拟任务"""
+    trace1, trace2, output_csv, champsim_bin, warmup, simulation = args_tuple
+    name1 = get_trace_name(trace1)
+    name2 = get_trace_name(trace2)
 
     result = {
-        "trace": trace_name,
+        "trace1": name1,
+        "trace2": name2,
         "output": output_csv,
         "success": False,
         "error": None,
@@ -60,7 +67,8 @@ def run_single(args_tuple: tuple) -> dict:
         "--warmup-instructions", str(warmup),
         "--simulation-instructions", str(simulation),
         "--csv-output", output_csv,
-        trace,
+        trace1,
+        trace2,
     ]
 
     try:
@@ -86,7 +94,7 @@ def run_single(args_tuple: tuple) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="单核 LRU 逐 trace 运行 ChampSim 模拟器",
+        description="两核 Even 分区模拟：traces 两两组合运行 ChampSim",
     )
     parser.add_argument(
         "--bin", type=str, default=str(DEFAULT_BIN),
@@ -114,11 +122,15 @@ def main():
     )
     parser.add_argument(
         "--skip-existing", action="store_true",
-        help="跳过已存在结果的 trace",
+        help="跳过已存在结果的组合",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="只显示将运行的任务，不实际执行",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="限制运行的任务数量（用于测试）",
     )
 
     args = parser.parse_args()
@@ -142,19 +154,28 @@ def main():
 
     print(f"找到 {len(traces)} 个 trace 文件")
 
+    # 生成 C(n,2) 两两组合
     tasks = []
-    for trace in traces:
-        name = get_trace_name(trace)
-        output_csv = str(stats_dir / f"{name}.csv")
-        tasks.append((trace, output_csv, str(champsim_bin),
-                       args.warmup, args.simulation))
+    for trace1, trace2 in itertools.combinations(traces, 2):
+        name1 = get_trace_name(trace1)
+        name2 = get_trace_name(trace2)
+        output_csv = str(stats_dir / f"{name1}+{name2}.csv")
+        tasks.append((trace1, trace2, output_csv, str(champsim_bin),
+                      args.warmup, args.simulation))
+
+    total_combinations = len(tasks)
+    print(f"共有 {total_combinations} 个组合 (C({len(traces)},2))")
 
     if args.skip_existing:
         before = len(tasks)
-        tasks = [t for t in tasks if not os.path.exists(t[1])]
+        tasks = [t for t in tasks if not os.path.exists(t[2])]
         skipped = before - len(tasks)
         if skipped:
             print(f"跳过 {skipped} 个已存在的结果")
+
+    if args.limit:
+        tasks = tasks[: args.limit]
+        print(f"限制运行 {len(tasks)} 个任务")
 
     if not tasks:
         print("没有任务需要运行")
@@ -164,10 +185,12 @@ def main():
 
     if args.dry_run:
         print(f"\n将运行 {len(tasks)} 个任务:")
-        print("-" * 60)
-        for i, t in enumerate(tasks):
-            print(f"  {i+1:3d}. {get_trace_name(t[0])}")
-        print("-" * 60)
+        print("-" * 70)
+        for i, t in enumerate(tasks[:20]):
+            print(f"  {i+1:4d}. {get_trace_name(t[0])} + {get_trace_name(t[1])}")
+        if len(tasks) > 20:
+            print(f"  ... 还有 {len(tasks) - 20} 个任务")
+        print("-" * 70)
         print(f"可执行文件: {champsim_bin}")
         print(f"输出目录:   {stats_dir}")
         print(f"并行进程数: {args.workers}")
@@ -175,10 +198,10 @@ def main():
         print(f"Simulation: {args.simulation:,} 指令")
         return
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"使用 {args.workers} 个进程并行运行 {len(tasks)} 个模拟任务")
     print(f"输出目录: {stats_dir}")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
 
     start_time = time.time()
     completed = 0
@@ -203,15 +226,15 @@ def main():
             remaining = (len(tasks) - completed) * avg / max(args.workers, 1)
 
             print(
-                f"[{completed:3d}/{len(tasks)}] {status:4s} "
-                f"{result['trace']}  ({result['duration']:.1f}s)  "
+                f"[{completed:4d}/{len(tasks)}] {status:4s} "
+                f"{result['trace1']} + {result['trace2']}  ({result['duration']:.1f}s)  "
                 f"预计剩余: {remaining/60:.1f}min"
             )
             if not result["success"]:
                 print(f"         错误: {result['error']}")
 
     total_time = time.time() - start_time
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"完成! 总用时: {total_time/60:.1f} 分钟")
     print(f"成功: {completed - failed}, 失败: {failed}")
     print(f"结果保存在: {stats_dir}")

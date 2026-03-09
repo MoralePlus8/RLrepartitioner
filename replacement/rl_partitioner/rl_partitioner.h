@@ -2,13 +2,15 @@
  * @file rl_partitioner.h
  * @brief 基于 Q-learning 和 Tile Coding 的 LLC 缓存分区策略
  * 
- * 核心设计：采用 "单权重表 + 对称状态映射 + 动作翻转" 策略，
- * 处理两个核心组（Group 1 和 Group 2）之间的 LLC Way 分配问题。
+ * 核心设计：采用 "单权重表 + 对称状态映射 + 动作翻转" 策略。
+ * 支持 N 个核心组的动态 LLC Way 分配（N ≥ 2），基于 "one-vs-rest" 思想
+ * 将每个核心组与其余所有核心组组成二元状态，复用两组模型进行决策。
  */
 
 #ifndef REPLACEMENT_RL_PARTITIONER_H
 #define REPLACEMENT_RL_PARTITIONER_H
 
+#include <array>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -24,21 +26,21 @@
  * @class rl_partitioner
  * @brief 基于强化学习的 LLC 缓存分区替换策略
  * 
- * 使用 Q-learning + Tile Coding 来动态调整 Group 1 和 Group 2 的 LLC Way 分配。
- * 状态空间：(A1, A2, M1, M2, P)
- *   - A1, A2: 两个组的 LLC Access 数
- *   - M1, M2: 两个组的 LLC Miss 数
- *   - P: 分配给 Group 1 的 Way 数量
+ * 支持 N 个核心组的 LLC Way 动态分配。对于每个核心组 S_i，
+ * 将其余 N-1 个核心组视为整体，构造 "one-vs-rest" 五元组状态空间：
+ *   (A_i, A_rest, M_i, M_rest, P_i)
+ * 在每个决策周期，通过约束优化选取使总 Q 值最大的动作组合，
+ * 保证各核心组 Way 总数不变（#INC = #DEC）。
  */
 class rl_partitioner : public champsim::modules::replacement
 {
 public:
     // ===== 动作空间定义 =====
-    // 动作定义为 Group 1 的 Way 变化量
+    // 动作定义为当前核心组的 Way 变化量
     enum Action {
-        ACTION_DEC = 0,   // P 减 1 (Group 1 减, Group 2 增)
-        ACTION_KEEP = 1,  // P 不变
-        ACTION_INC = 2    // P 加 1 (Group 1 增, Group 2 减)
+        ACTION_DEC = 0,   // 该核心组 Way 数减 1
+        ACTION_KEEP = 1,  // 该核心组 Way 数不变
+        ACTION_INC = 2    // 该核心组 Way 数加 1
     };
     static constexpr int NUM_ACTIONS = 3;
 
@@ -95,8 +97,13 @@ private:
     std::vector<uint64_t> last_used_cycles;        // LRU 时间戳
     uint64_t cycle = 0;                            // 内部周期计数器
     
+    // ===== 多核心组配置 =====
+    int num_groups_;                                   // 核心组数量
+    std::vector<uint32_t> cpu_to_group_;               // CPU ID → 核心组 ID 映射
+    std::vector<std::vector<uint32_t>> group_cpus_;    // 核心组 ID → CPU 列表
+    
     // ===== 分区状态 =====
-    long partition_p;                              // 分配给 Group 1 的 Way 数量
+    std::vector<long> partition_ways_;                  // 各核心组分配的 Way 数量
     
     // ===== Q-Learning 权重表 =====
     // 单一权重表，两个组共用
@@ -108,14 +115,17 @@ private:
     double active_epsilon;     // 实际使用的探索率
     bool online_mode;          // 是否处于在线微调模式
     
-    // ===== 状态缓存（上一时刻的状态）=====
-    double last_A1, last_A2, last_M1, last_M2;     // 上一时刻的 Access 和 Miss
-    long last_P;                                   // 上一时刻的分区设置
-    Action last_action;                            // 上一时刻的动作
+    // ===== 状态缓存（上一时刻各核心组的 "one-vs-rest" 状态）=====
+    std::vector<double> last_norm_a_;              // 各核心组上一时刻的归一化 Access
+    std::vector<double> last_norm_m_;              // 各核心组上一时刻的归一化 Miss
+    std::vector<double> last_norm_a_rest_;         // 各核心组对应 "rest" 的归一化 Access
+    std::vector<double> last_norm_m_rest_;         // 各核心组对应 "rest" 的归一化 Miss
+    std::vector<long> last_partition_;             // 各核心组上一时刻的 Way 分配
+    std::vector<Action> last_actions_;             // 各核心组上一时刻的动作
     
     // ===== IPC 基线（EWMA）=====
-    double baseline_ipc_g1;                        // Group 1 的 IPC 基线
-    double baseline_ipc_g2;                        // Group 2 的 IPC 基线
+    std::vector<double> baseline_ipc_;             // 各核心组的 IPC 基线
+    std::vector<double> baseline_ipc_rest_;        // 各核心组对应 "rest" 的 IPC 基线
     
     // ===== 上一次 RL 更新的全局 cycle =====
     uint64_t last_update_cycle;
@@ -311,10 +321,38 @@ private:
     // ===== 辅助函数 =====
     
     /**
-     * @brief 执行分区动作
-     * @param action 动作
+     * @brief 解析核心组配置（环境变量 RL_CORE_GROUPS / RL_NUM_GROUPS）
      */
-    void apply_action(Action action);
+    void parse_core_group_config();
+    
+    /**
+     * @brief 获取核心组的 Way 起始索引
+     * @param group_id 核心组 ID
+     * @return 起始 Way 索引
+     */
+    long get_way_start(uint32_t group_id) const;
+    
+    /**
+     * @brief 使用动态规划选取满足约束的最优动作组合
+     * 
+     * 约束：各核心组动作导致的 Way 变化之和为 0（#INC = #DEC）。
+     * @param q_values q_values[i][a] = 核心组 i 执行动作 a 的 Q 值
+     * @return 各核心组的最优动作
+     */
+    std::vector<Action> select_best_actions_constrained(
+        const std::vector<std::array<double, NUM_ACTIONS>>& q_values) const;
+    
+    /**
+     * @brief 生成满足约束的随机动作组合（用于 ε-greedy 探索）
+     * @return 各核心组的随机动作
+     */
+    std::vector<Action> select_random_actions_constrained();
+    
+    /**
+     * @brief 执行多组分区动作
+     * @param actions 各核心组的动作向量
+     */
+    void apply_actions(const std::vector<Action>& actions);
     
     /**
      * @brief 简单的位混合哈希函数
@@ -324,9 +362,9 @@ private:
     static uint64_t hash_mix(uint64_t x);
     
     /**
-     * @brief 获取 CPU 所属的组 ID
+     * @brief 获取 CPU 所属的核心组 ID
      * @param cpu CPU 编号
-     * @return 组 ID (0 或 1)
+     * @return 核心组 ID
      */
     uint32_t get_group_id(uint32_t cpu) const;
     
