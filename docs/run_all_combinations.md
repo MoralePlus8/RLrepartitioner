@@ -41,6 +41,7 @@ python run_all_combinations.py --dry-run
 | `--skip-existing` | — | 跳过已有 CSV 结果的任务 |
 | `--dry-run` | — | 仅打印任务列表，不执行 |
 | `--limit N` | — | 只运行前 N 个任务（用于测试） |
+| `--eval` | — | 评估模式，不保存权重文件且禁用共享内存 |
 
 ## 使用示例
 

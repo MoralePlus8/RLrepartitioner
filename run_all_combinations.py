@@ -319,6 +319,11 @@ def main():
         help="禁用共享内存，各进程使用文件 load/save 独立训练"
     )
     parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="纯评估模式：加载权重但不保存、不更新共享内存（只读评估）"
+    )
+    parser.add_argument(
         "--csv-prefix",
         type=str,
         default="rl_",
@@ -346,7 +351,8 @@ def main():
     champsim_bin = Path(args.bin)
     traces_dir = Path(args.traces_dir)
     stats_dir = Path(args.stats_dir)
-    use_shared = not args.no_shared_weights
+    eval_mode = args.eval
+    use_shared = not args.no_shared_weights and not eval_mode
 
     # ------------------------------------------------------------------
     # 检查前置条件
@@ -371,11 +377,16 @@ def main():
     # 构造子进程环境变量
     # ------------------------------------------------------------------
     extra_env = {}
-    extra_env["RL_WEIGHTS_SAVE"] = args.weights_file
-    extra_env["RL_WEIGHTS_LOAD"] = args.weights_file   # 作为回退
 
-    if use_shared:
-        extra_env["RL_SHARED_WEIGHTS"] = args.shm_path
+    if eval_mode:
+        # 纯评估模式：只加载权重，不保存、不使用共享内存
+        extra_env["RL_WEIGHTS_LOAD"] = args.weights_file
+        extra_env["RL_ONLINE_MODE"] = "1"
+    else:
+        extra_env["RL_WEIGHTS_SAVE"] = args.weights_file
+        extra_env["RL_WEIGHTS_LOAD"] = args.weights_file
+        if use_shared:
+            extra_env["RL_SHARED_WEIGHTS"] = args.shm_path
 
     # ------------------------------------------------------------------
     # 生成任务列表
@@ -420,7 +431,9 @@ def main():
         print(f"输出目录:     {stats_dir}")
         print(f"可执行文件:   {champsim_bin}")
         print(f"并行进程数:   {args.workers}")
-        print(f"共享内存:     {'启用 (' + args.shm_path + ')' if use_shared else '禁用'}")
+        mode_str = "纯评估（只读，不保存权重）" if eval_mode else (
+            "训练 + 共享内存 (" + args.shm_path + ")" if use_shared else "训练（独立，无共享内存）")
+        print(f"运行模式:     {mode_str}")
         print(f"权重文件:     {args.weights_file}")
         print(f"Warmup:       {args.warmup:,} 指令")
         print(f"Simulation:   {args.simulation:,} 指令")
@@ -438,8 +451,12 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n{'='*70}")
     print(f"使用 {args.workers} 个进程并行运行 {len(tasks)} 个模拟任务")
-    if use_shared:
-        print(f"共享内存: {args.shm_path}")
+    if eval_mode:
+        print(f"模式: 纯评估（只读权重，不保存）")
+    elif use_shared:
+        print(f"模式: 训练 + 共享内存 ({args.shm_path})")
+    else:
+        print(f"模式: 训练（独立，无共享内存）")
     print(f"权重文件: {args.weights_file}")
     print(f"{'='*70}")
 
@@ -490,7 +507,10 @@ def main():
     print(f"完成！总用时: {total_time/60:.1f} 分钟 ({total_time/3600:.2f} 小时)")
     print(f"成功: {completed - failed}, 失败: {failed}")
     print(f"结果保存在: {stats_dir}")
-    print(f"权重保存在: {args.weights_file}")
+    if not eval_mode:
+        print(f"权重保存在: {args.weights_file}")
+    else:
+        print(f"纯评估模式，权重未修改")
 
 
 if __name__ == "__main__":
