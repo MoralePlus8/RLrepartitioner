@@ -239,6 +239,9 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
         // CPU evicting_cpu caused an eviction of CPU evicted_cpu's cache line
         if (evicting_cpu < MAX_CPUS_FOR_COMPETITION) {
           ++g_llc_stats.evictions_caused[evicting_cpu];
+          if (fill_mshr.type != access_type::WRITE) {
+            ++g_llc_stats.evictions_caused_without_wb[evicting_cpu];
+          }
         }
         if (evicted_cpu < MAX_CPUS_FOR_COMPETITION) {
           ++g_llc_stats.evicted_by_others[evicted_cpu];

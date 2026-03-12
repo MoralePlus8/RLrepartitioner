@@ -24,9 +24,12 @@ struct llc_stats {
   // Cache competition stats
   std::vector<uint64_t> evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  // Same as evictions_caused but excluding L2 writeback-induced evictions
+  std::vector<uint64_t> evictions_caused_without_wb = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   // Last heartbeat values for computing per-period competition stats
   std::vector<uint64_t> last_heartbeat_evictions_caused = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
   std::vector<uint64_t> last_heartbeat_evicted_by_others = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
+  std::vector<uint64_t> last_heartbeat_evictions_caused_without_wb = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);
 
   // LLC access stats per CPU
   std::vector<uint64_t> accesses = std::vector<uint64_t>(MAX_CPUS_FOR_COMPETITION, 0);  // Total LLC accesses per CPU

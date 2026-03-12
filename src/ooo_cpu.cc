@@ -88,17 +88,20 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
     // Calculate competition stats (always, for CSV export)
     uint64_t period_evictions_caused = g_llc_stats.evictions_caused[cpu] - g_llc_stats.last_heartbeat_evictions_caused[cpu];
     uint64_t period_evicted_by_others = g_llc_stats.evicted_by_others[cpu] - g_llc_stats.last_heartbeat_evicted_by_others[cpu];
+    uint64_t period_evictions_caused_without_wb = g_llc_stats.evictions_caused_without_wb[cpu] - g_llc_stats.last_heartbeat_evictions_caused_without_wb[cpu];
     
     // Print LLC cache competition stats for this CPU (only when NUM_CPUS > 1)
     if (NUM_CPUS > 1) {
-      fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {})\n",
+      fmt::print("  LLC Competition CPU {}: evicted others: {} (total: {}), evicted by others: {} (total: {}), evicted others (no wb): {} (total: {})\n",
                  cpu, period_evictions_caused, g_llc_stats.evictions_caused[cpu],
-                 period_evicted_by_others, g_llc_stats.evicted_by_others[cpu]);
+                 period_evicted_by_others, g_llc_stats.evicted_by_others[cpu],
+                 period_evictions_caused_without_wb, g_llc_stats.evictions_caused_without_wb[cpu]);
     }
     
     // Update last heartbeat competition values for this CPU
     g_llc_stats.last_heartbeat_evictions_caused[cpu] = g_llc_stats.evictions_caused[cpu];
     g_llc_stats.last_heartbeat_evicted_by_others[cpu] = g_llc_stats.evicted_by_others[cpu];
+    g_llc_stats.last_heartbeat_evictions_caused_without_wb[cpu] = g_llc_stats.evictions_caused_without_wb[cpu];
     
     // Print cache line lifetime statistics
     uint64_t period_total_lifetime = g_llc_stats.total_lifetime_cycles[cpu] - g_llc_stats.last_heartbeat_total_lifetime_cycles[cpu];
@@ -165,7 +168,7 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
         if (csv_file.is_open()) {
           csv_file << "heartbeat,cpu,global_cycle,cpu_cycle,instructions,ipc,"
                    << "period_accesses,period_misses,period_miss_rate,"
-                   << "period_evictions_caused,period_evicted_by_others,"
+                   << "period_evictions_caused,period_evictions_caused_without_wb,period_evicted_by_others,"
                    << "period_avg_lifetime_cycles,period_eviction_count,"
                    << "period_avg_way_occupancy,period_total_evictions_caused,"
                    << "little_law_lifetime,period_fill_count\n";
@@ -187,6 +190,7 @@ void O3_CPU::print_heartbeat(uint64_t heartbeat_count, uint64_t global_cycle)
                  << period_misses << ","
                  << period_miss_rate << ","
                  << period_evictions_caused << ","
+                 << period_evictions_caused_without_wb << ","
                  << period_evicted_by_others << ","
                  << period_avg_lifetime << ","
                  << period_eviction_count << ","
