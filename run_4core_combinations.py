@@ -80,7 +80,7 @@ def run_single(args_tuple: tuple) -> dict:
 
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=43200,
+            cmd, capture_output=True, text=True, timeout=86400,
         )
         if os.path.exists(output_csv):
             result["success"] = True
