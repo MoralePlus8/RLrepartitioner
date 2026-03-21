@@ -42,6 +42,8 @@ python run_all_combinations.py --dry-run
 | `--dry-run` | — | 仅打印任务列表，不执行 |
 | `--limit N` | — | 只运行前 N 个任务（用于测试） |
 | `--eval` | — | 评估模式，不保存权重文件且禁用共享内存 |
+| `--cores` | 2 | 选择核心数量配置 |
+| `--combinations-csv` | stats/trace_combinations_100.csv | 指定 4 核组合的 CSV 来源 |
 
 ## 使用示例
 

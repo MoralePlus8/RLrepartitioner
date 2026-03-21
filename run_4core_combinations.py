@@ -91,7 +91,7 @@ def run_single(args_tuple: tuple) -> dict:
             if proc.stderr:
                 result["error"] += f"\nStderr: {proc.stderr[:500]}"
     except subprocess.TimeoutExpired:
-        result["error"] = "Timed out (>12h)"
+        result["error"] = "Timed out (>24h)"
     except Exception as e:
         result["error"] = str(e)
 

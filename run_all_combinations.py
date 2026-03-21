@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-批量运行ChampSim模拟器，遍历所有trace文件的两两组合
+批量运行ChampSim模拟器，支持 2 核和 4 核配置
+  - 2 核模式：遍历 traces 目录下所有 trace 文件的 C(n,2) 组合
+  - 4 核模式：从 stats/trace_combinations_100.csv 读取预定义的 4-trace 组合
 支持通过 mmap 共享内存实现多进程并行 RL 权重训练
 """
 
 import os
 import sys
+import csv
 import glob
 import struct
 import shutil
@@ -21,9 +24,12 @@ import time
 # ============================================================================
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-DEFAULT_CHAMPSIM_BIN = PROJECT_ROOT / "bin" / "champsim"
+DEFAULT_CHAMPSIM_BIN_2CORE = PROJECT_ROOT / "bin" / "champsim_2core_rl"
+DEFAULT_CHAMPSIM_BIN_4CORE = PROJECT_ROOT / "bin" / "champsim_4core_rl"
 DEFAULT_TRACES_DIR = PROJECT_ROOT / "traces"
 DEFAULT_STATS_DIR = PROJECT_ROOT / "stats"
+DEFAULT_STATS_DIR_4CORE = PROJECT_ROOT / "stats" / "rl_4core"
+DEFAULT_COMBINATIONS_CSV = PROJECT_ROOT / "stats" / "trace_combinations_100.csv"
 DEFAULT_WARMUP = 50000000          # 50M
 DEFAULT_SIMULATION = 500000000    # 500M
 DEFAULT_WORKERS = 8
@@ -40,6 +46,8 @@ RL_GRID_SIZE_M = 10
 RL_MEMORY_SIZE = 4096
 RL_NUM_ACTIONS = 3
 RL_TOTAL_WEIGHTS = RL_MEMORY_SIZE * RL_NUM_ACTIONS   # 12288
+
+TRACE_SUFFIXES = [".champsimtrace.xz", ".trace.xz"]
 
 
 # ============================================================================
@@ -141,10 +149,43 @@ def get_trace_files(traces_dir: Path) -> list:
 def get_trace_name(trace_path: str) -> str:
     """从trace文件路径中提取简短名称（不含扩展名）"""
     basename = os.path.basename(trace_path)
-    for suffix in [".champsimtrace.xz", ".trace.xz"]:
+    for suffix in TRACE_SUFFIXES:
         if basename.endswith(suffix):
             return basename[:-len(suffix)]
     return basename
+
+
+def resolve_trace_path(trace_name: str, traces_dir: Path) -> str | None:
+    """根据 trace 名称解析为 traces 目录下的完整路径"""
+    for suffix in TRACE_SUFFIXES:
+        path = traces_dir / f"{trace_name}{suffix}"
+        if path.exists():
+            return str(path)
+    return None
+
+
+def load_combinations_csv(csv_path: Path) -> list[tuple[int, list[str]]]:
+    """
+    从 CSV 加载 4-trace 组合，返回 (combo_id, [trace1, trace2, trace3, trace4]) 列表。
+    使用标准库 csv 模块，无需 pandas。
+    """
+    combos = []
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        required = ["combo_id", "trace_1", "trace_2", "trace_3", "trace_4"]
+        if reader.fieldnames is None:
+            print(f"错误: CSV 文件为空: {csv_path}", file=sys.stderr)
+            sys.exit(1)
+        for col in required:
+            if col not in reader.fieldnames:
+                print(f"错误: CSV 缺少列 '{col}'", file=sys.stderr)
+                sys.exit(1)
+        for row in reader:
+            combo_id = int(row["combo_id"])
+            traces = [row["trace_1"], row["trace_2"],
+                      row["trace_3"], row["trace_4"]]
+            combos.append((combo_id, traces))
+    return combos
 
 
 # ============================================================================
@@ -153,21 +194,19 @@ def get_trace_name(trace_path: str) -> str:
 
 def run_simulation(args_tuple: tuple) -> dict:
     """
-    运行单个模拟任务
+    运行单个模拟任务（支持 2 核或 4 核）
 
     Args:
-        args_tuple: (trace1, trace2, output_csv, champsim_bin,
+        args_tuple: (traces_list, output_csv, champsim_bin,
                      warmup, simulation, extra_env) 元组
     """
-    (trace1, trace2, output_csv, champsim_bin,
+    (traces, output_csv, champsim_bin,
      warmup, simulation, extra_env) = args_tuple
 
-    trace1_name = get_trace_name(trace1)
-    trace2_name = get_trace_name(trace2)
+    trace_names = [get_trace_name(t) for t in traces]
 
     result = {
-        "trace1": trace1_name,
-        "trace2": trace2_name,
+        "traces": " + ".join(trace_names),
         "output": output_csv,
         "success": False,
         "error": None,
@@ -181,8 +220,7 @@ def run_simulation(args_tuple: tuple) -> dict:
         "--warmup-instructions", str(warmup),
         "--simulation-instructions", str(simulation),
         "--csv-output", output_csv,
-        trace1,
-        trace2
+        *traces
     ]
 
     env = os.environ.copy()
@@ -195,7 +233,7 @@ def run_simulation(args_tuple: tuple) -> dict:
             env=env,
             capture_output=True,
             text=True,
-            timeout=43200 # 12 hours
+            timeout=86400 # 24 hours
         )
 
         if os.path.exists(output_csv):
@@ -207,7 +245,7 @@ def run_simulation(args_tuple: tuple) -> dict:
                 result["error"] += f"\nStderr: {process.stderr[:500]}"
 
     except subprocess.TimeoutExpired:
-        result["error"] = "Simulation timed out (>10 hours)"
+        result["error"] = "Simulation timed out (>24 hours)"
     except Exception as e:
         result["error"] = str(e)
 
@@ -215,20 +253,42 @@ def run_simulation(args_tuple: tuple) -> dict:
     return result
 
 
-def generate_task_list(traces: list, stats_dir: Path, champsim_bin: Path,
-                       warmup: int, simulation: int,
-                       extra_env: dict = None,
-                       csv_prefix: str = "rl_") -> list:
-    """
-    生成所有 C(n,2) 任务列表
-    """
+def generate_task_list_2core(traces: list, stats_dir: Path, champsim_bin: Path,
+                             warmup: int, simulation: int,
+                             extra_env: dict = None,
+                             csv_prefix: str = "rl_") -> list:
+    """生成 2 核 C(n,2) 任务列表"""
     tasks = []
     for trace1, trace2 in itertools.combinations(traces, 2):
         name1 = get_trace_name(trace1)
         name2 = get_trace_name(trace2)
         output_csv = str(stats_dir / f"{csv_prefix}{name1}+{name2}.csv")
-        tasks.append((trace1, trace2, output_csv, str(champsim_bin),
+        tasks.append(([trace1, trace2], output_csv, str(champsim_bin),
                        warmup, simulation, extra_env))
+    return tasks
+
+
+def generate_task_list_4core(combinations_csv: Path, traces_dir: Path,
+                             stats_dir: Path, champsim_bin: Path,
+                             warmup: int, simulation: int,
+                             extra_env: dict = None,
+                             csv_prefix: str = "rl_") -> list:
+    """从 CSV 读取 4-trace 组合，生成 4 核任务列表"""
+    combos = load_combinations_csv(combinations_csv)
+    tasks = []
+    for combo_id, trace_names in combos:
+        paths = []
+        for name in trace_names:
+            p = resolve_trace_path(name, traces_dir)
+            if p is None:
+                print(f"警告: 跳过 combo {combo_id}，未找到 trace: {name}")
+                break
+            paths.append(p)
+        if len(paths) == 4:
+            output_name = f"{csv_prefix}{'+'.join(trace_names)}.csv"
+            output_csv = str(stats_dir / output_name)
+            tasks.append((paths, output_csv, str(champsim_bin),
+                           warmup, simulation, extra_env))
     return tasks
 
 
@@ -236,7 +296,7 @@ def filter_existing_tasks(tasks: list) -> list:
     """过滤掉已经存在结果的任务"""
     filtered = []
     for task in tasks:
-        output_csv = task[2]
+        output_csv = task[1]  # traces_list, output_csv, ...
         if not os.path.exists(output_csv):
             filtered.append(task)
     return filtered
@@ -248,22 +308,45 @@ def filter_existing_tasks(tasks: list) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="批量运行ChampSim模拟器 (支持共享内存 RL 权重训练)",
+        description="批量运行ChampSim模拟器 (支持 2 核 / 4 核，共享内存 RL 权重训练)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 2 核模式 (默认)
   python run_all_combinations.py --dry-run                    # 预览任务
-  python run_all_combinations.py --limit 10                   # 只运行10个任务（测试）
+  python run_all_combinations.py --limit 10                   # 只运行10个任务
   python run_all_combinations.py --skip-existing              # 跳过已有结果
+
+  # 4 核模式
+  python run_all_combinations.py --cores 4 --dry-run
+  python run_all_combinations.py --cores 4 --skip-existing
+  python run_all_combinations.py --cores 4 --combinations-csv stats/trace_combinations_100.csv
+
+  # 通用选项
   python run_all_combinations.py --workers 4                  # 使用4个并行进程
-  python run_all_combinations.py --no-shared-weights          # 禁用共享内存（各进程独立训练）
+  python run_all_combinations.py --no-shared-weights          # 禁用共享内存
         """
+    )
+    parser.add_argument(
+        "--cores",
+        type=int,
+        choices=[2, 4],
+        default=2,
+        help="核心数配置：2 = 两两组合, 4 = 从 CSV 读取四核组合 (默认: 2)"
     )
     parser.add_argument(
         "--bin",
         type=str,
-        default=str(DEFAULT_CHAMPSIM_BIN),
-        help=f"ChampSim 可执行文件路径 (默认: {DEFAULT_CHAMPSIM_BIN})"
+        default=None,
+        help=("ChampSim 可执行文件路径 "
+              f"(默认: 2核={DEFAULT_CHAMPSIM_BIN_2CORE}, "
+              f"4核={DEFAULT_CHAMPSIM_BIN_4CORE})")
+    )
+    parser.add_argument(
+        "--combinations-csv",
+        type=str,
+        default=str(DEFAULT_COMBINATIONS_CSV),
+        help=f"4 核模式的组合列表 CSV 路径 (默认: {DEFAULT_COMBINATIONS_CSV})"
     )
     parser.add_argument(
         "--traces-dir",
@@ -274,8 +357,10 @@ def main():
     parser.add_argument(
         "--stats-dir",
         type=str,
-        default=str(DEFAULT_STATS_DIR),
-        help=f"统计结果输出目录 (默认: {DEFAULT_STATS_DIR})"
+        default=None,
+        help=("统计结果输出目录 "
+              f"(默认: 2核={DEFAULT_STATS_DIR}, "
+              f"4核={DEFAULT_STATS_DIR_4CORE})")
     )
     parser.add_argument(
         "--workers",
@@ -348,9 +433,22 @@ def main():
 
     args = parser.parse_args()
 
-    champsim_bin = Path(args.bin)
+    # ------------------------------------------------------------------
+    # 根据核心数解析默认值
+    # ------------------------------------------------------------------
+    if args.bin is None:
+        champsim_bin = (DEFAULT_CHAMPSIM_BIN_4CORE if args.cores == 4
+                        else DEFAULT_CHAMPSIM_BIN_2CORE)
+    else:
+        champsim_bin = Path(args.bin)
+
+    if args.stats_dir is None:
+        stats_dir = (DEFAULT_STATS_DIR_4CORE if args.cores == 4
+                     else DEFAULT_STATS_DIR)
+    else:
+        stats_dir = Path(args.stats_dir)
+
     traces_dir = Path(args.traces_dir)
-    stats_dir = Path(args.stats_dir)
     eval_mode = args.eval
     use_shared = not args.no_shared_weights and not eval_mode
 
@@ -366,20 +464,12 @@ def main():
         print(f"错误: Traces 目录不存在: {traces_dir}")
         sys.exit(1)
 
-    traces = get_trace_files(traces_dir)
-    if not traces:
-        print(f"错误: 在 {traces_dir} 目录下未找到 trace 文件")
-        sys.exit(1)
-
-    print(f"找到 {len(traces)} 个 trace 文件")
-
     # ------------------------------------------------------------------
     # 构造子进程环境变量
     # ------------------------------------------------------------------
     extra_env = {}
 
     if eval_mode:
-        # 纯评估模式：只加载权重，不保存、不使用共享内存
         extra_env["RL_WEIGHTS_LOAD"] = args.weights_file
         extra_env["RL_ONLINE_MODE"] = "1"
     else:
@@ -391,13 +481,32 @@ def main():
     # ------------------------------------------------------------------
     # 生成任务列表
     # ------------------------------------------------------------------
-    tasks = generate_task_list(traces, stats_dir, champsim_bin,
-                               args.warmup, args.simulation,
-                               extra_env=extra_env,
-                               csv_prefix=args.csv_prefix)
+    if args.cores == 4:
+        combinations_csv = Path(args.combinations_csv)
+        if not combinations_csv.exists():
+            print(f"错误: 组合列表 CSV 不存在: {combinations_csv}")
+            sys.exit(1)
+
+        tasks = generate_task_list_4core(
+            combinations_csv, traces_dir, stats_dir, champsim_bin,
+            args.warmup, args.simulation,
+            extra_env=extra_env, csv_prefix=args.csv_prefix)
+        print(f"从 {combinations_csv} 加载 {len(tasks)} 个有效的 4 核组合")
+    else:
+        traces = get_trace_files(traces_dir)
+        if not traces:
+            print(f"错误: 在 {traces_dir} 目录下未找到 trace 文件")
+            sys.exit(1)
+        print(f"找到 {len(traces)} 个 trace 文件")
+
+        tasks = generate_task_list_2core(
+            traces, stats_dir, champsim_bin,
+            args.warmup, args.simulation,
+            extra_env=extra_env, csv_prefix=args.csv_prefix)
+        n = len(traces)
+        print(f"共有 {len(tasks)} 个组合 (C({n},2) = {n}*{n-1}//2)")
+
     total_combinations = len(tasks)
-    n = len(traces)
-    print(f"共有 {total_combinations} 个组合 (C({n},2) = {n}*{n-1}//2)")
 
     if args.skip_existing:
         tasks = filter_existing_tasks(tasks)
@@ -422,21 +531,24 @@ def main():
         print(f"\n将要运行的任务 (共 {len(tasks)} 个):")
         print("-" * 70)
         for i, task in enumerate(tasks[:20]):
-            trace1, trace2 = task[0], task[1]
-            print(f"  {i+1:4d}. {get_trace_name(trace1)}"
-                  f" + {get_trace_name(trace2)}")
+            trace_names = [get_trace_name(t) for t in task[0]]
+            print(f"  {i+1:4d}. {' + '.join(trace_names)}")
         if len(tasks) > 20:
             print(f"  ... 还有 {len(tasks) - 20} 个任务")
         print("-" * 70)
+        print(f"核心数:       {args.cores}")
         print(f"输出目录:     {stats_dir}")
         print(f"可执行文件:   {champsim_bin}")
         print(f"并行进程数:   {args.workers}")
         mode_str = "纯评估（只读，不保存权重）" if eval_mode else (
-            "训练 + 共享内存 (" + args.shm_path + ")" if use_shared else "训练（独立，无共享内存）")
+            "训练 + 共享内存 (" + args.shm_path + ")" if use_shared
+            else "训练（独立，无共享内存）")
         print(f"运行模式:     {mode_str}")
         print(f"权重文件:     {args.weights_file}")
         print(f"Warmup:       {args.warmup:,} 指令")
         print(f"Simulation:   {args.simulation:,} 指令")
+        if args.cores == 4:
+            print(f"组合来源:     {args.combinations_csv}")
         return
 
     # ------------------------------------------------------------------
@@ -450,7 +562,7 @@ def main():
     # 运行模拟
     # ------------------------------------------------------------------
     print(f"\n{'='*70}")
-    print(f"使用 {args.workers} 个进程并行运行 {len(tasks)} 个模拟任务")
+    print(f"使用 {args.workers} 个进程并行运行 {len(tasks)} 个 {args.cores} 核模拟任务")
     if eval_mode:
         print(f"模式: 纯评估（只读权重，不保存）")
     elif use_shared:
@@ -485,7 +597,7 @@ def main():
             remaining = (len(tasks) - completed) * avg_time / max(args.workers, 1)
 
             print(f"[{completed:4d}/{len(tasks)}] {status} "
-                  f"{result['trace1']} + {result['trace2']} "
+                  f"{result['traces']} "
                   f"({result['duration']:.1f}s) "
                   f"- 预计剩余: {remaining/60:.1f}分钟")
 
@@ -498,7 +610,6 @@ def main():
     if use_shared:
         print("\n保存最终权重...")
         save_final_weights(args.shm_path, args.weights_file)
-        # 保留共享内存文件以备调试，用户可手动清理
         print(f"(共享内存文件 {args.shm_path} 已保留，可手动删除)")
 
     # 输出统计
