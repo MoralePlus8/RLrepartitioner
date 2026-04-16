@@ -11,20 +11,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
-# ============ 论文插图风格配置 ============
+# ============ 论文插图风格配置（适配 Word 5号字 = 10.5pt）============
 plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'],
-    'font.size': 11,
-    'axes.labelsize': 12,
-    'axes.titlesize': 13,
-    'xtick.labelsize': 10,
-    'ytick.labelsize': 10,
-    'legend.fontsize': 10,
+    'font.size': 9,
+    'axes.labelsize': 10.5,
+    'axes.titlesize': 10.5,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
+    'legend.fontsize': 10.5,
     'figure.dpi': 100,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
-    'axes.linewidth': 1.0,
+    'axes.linewidth': 0.8,
     'axes.edgecolor': '#333333',
 })
 
@@ -99,7 +99,7 @@ y_pred = y_pred[positive_mask]
 print(f"过滤零值后剩余 {len(x_actual)} 个点（移除 {(~positive_mask).sum()} 个零值点）")
 
 # ============ 创建论文级插图（横轴长度为纵轴两倍）============
-fig, ax = plt.subplots(figsize=(12, 6))
+fig, ax = plt.subplots(figsize=(5.5, 3.0))
 
 COLOR_SCATTER = '#2563eb'
 COLOR_PERFECT = '#dc2626'
@@ -110,11 +110,11 @@ max_val = max(x_actual.max(), y_pred.max())
 line_range = np.logspace(np.log10(min_val), np.log10(max_val), 200)
 
 # 绘制 y=x 理想线
-ax.plot(line_range, line_range, color=COLOR_PERFECT, linewidth=2,
+ax.plot(line_range, line_range, color=COLOR_PERFECT, linewidth=1.2,
         linestyle='-.', zorder=3, label='y = x (perfect)')
 
 # 散点图：低透明度 + 小尺寸，通过重叠自然呈现密度
-ax.scatter(x_actual, y_pred, c=COLOR_SCATTER, alpha=0.08, s=4,
+ax.scatter(x_actual, y_pred, c=COLOR_SCATTER, alpha=0.04, s=2,
            edgecolors='none', zorder=2, rasterized=True)
 
 ax.set_xscale('log')
@@ -122,29 +122,28 @@ ax.set_yscale('log')
 ax.set_xlim(10, max_val * 1.1)
 ax.set_ylim(10, max_val * 1.1)
 
-ax.set_xlabel(r'Actual Evictions ($E$)', fontweight='medium')
-ax.set_ylabel(r'Predicted Evictions ($\hat{E}$)', fontweight='medium')
-ax.set_title('Prediction Accuracy (All Points)', fontsize=13, fontweight='medium')
+ax.set_xlabel(r'Actual Inter-core Evictions ($E$)', fontweight='medium')
+ax.set_ylabel(r'Predicted Inter-core Evictions ($\hat{E}$)', fontweight='medium')
 
 ax.grid(True, which='major', linestyle='-', alpha=0.25, color='#555555')
 ax.grid(True, which='minor', linestyle=':', alpha=0.15, color='#888888')
 
-ax.legend(loc='upper left', framealpha=0.95, edgecolor='#cccccc')
+ax.legend(loc='lower right', framealpha=0.95, edgecolor='#cccccc')
 
 textstr = (r'$r^2$ = ' + f'{r_squared:.3f}' + '\n' +
           r'MAPE = ' + f'{mape:.1f}%')
 props = dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='#cccccc',
              alpha=0.95, linewidth=1)
-ax.text(0.04, 0.04, textstr, transform=ax.transAxes, fontsize=10,
-        verticalalignment='bottom', bbox=props, family='monospace')
+ax.text(0.04, 0.96, textstr, transform=ax.transAxes, fontsize=8.5,
+        verticalalignment='top', bbox=props, family='monospace')
 
 for spine in ax.spines.values():
     spine.set_visible(True)
     spine.set_color('#333333')
 
 plt.tight_layout()
-plt.savefig('evictions_comparison.png', dpi=300, facecolor='white')
-plt.savefig('evictions_comparison.pdf', facecolor='white')
+plt.savefig('plot/evictions_comparison.png', dpi=300, facecolor='white')
+plt.savefig('plot/evictions_comparison.pdf', facecolor='white')
 plt.close()
 
 print(f"去除离群点后共 {n_after_outlier} 个点（原 {n_total} 个，剔除 {n_total - n_after_outlier} 个）")

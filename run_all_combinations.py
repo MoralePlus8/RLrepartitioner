@@ -233,7 +233,7 @@ def run_simulation(args_tuple: tuple) -> dict:
             env=env,
             capture_output=True,
             text=True,
-            timeout=86400 # 24 hours
+            timeout=186400 # 24 hours
         )
 
         if os.path.exists(output_csv):
